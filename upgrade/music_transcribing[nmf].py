@@ -152,3 +152,31 @@ plt.title("Activation matrix H")
 plt.xlabel("Time frames")
 plt.ylabel("Pitch / Component index")
 plt.show()
+
+def note_tracking(H,th=1.5):
+  mean = np.mean(H)
+  std = np.std(H)
+  thresh = mean + th * std
+  H_copy = np.zeros(H.shape)
+  for i in range(H.shape[1]):
+    indicies = np.where(H[:,i] > thresh)
+    H_copy[indicies,i] = 1
+  return H_copy
+
+H_est_vis = note_tracking(H_est_visualisation)
+plt.figure()
+plt.imshow(H_est_vis,aspect='auto', origin='lower')
+plt.colorbar()
+plt.title("Activation matrix H")
+plt.xlabel("Time frames")
+plt.ylabel("Pitch / Component index")
+plt.show()
+
+tempo, beats = librosa.beat.beat_track(y=x, sr=f_s)
+
+tempo = float(tempo)          # or: tempo = tempo.item()
+
+print(f"Estimated tempo: {tempo:.2f} BPM")
+
+beat_times = librosa.frames_to_time(beats, sr=f_s)
+print(f"Beat positions (sec.): {beat_times}")
