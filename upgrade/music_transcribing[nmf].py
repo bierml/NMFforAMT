@@ -19,7 +19,7 @@ from scipy.io import wavfile
 import numpy as np
 import librosa
 import nimfa
-gamma = 100
+gamma = 1
 f_s, x = wavfile.read("/content/FChopinPreludeOp28n4.wav")
 print(f_s)        # sample rate
 print(x.dtype)   # int16, int32, etc.
@@ -143,29 +143,62 @@ from scipy.signal import butter, filtfilt
 
 b, a = butter(2, 0.1)   # low-pass along time
 #H_est_visualisation = filtfilt(b, a, H_est, axis=1)
-H_est_visualisation = np.log(1+100*H_est[1::2,:])
+#H_est_visualisation = np.log(1+10*H_est[1::2,:])
 #H_est_visualisation = filtfilt(b, a, H_est_visualisation, axis=1)
 plt.figure()
-plt.imshow(H_est_visualisation, aspect='auto', origin='lower')
+plt.imshow(H_est[1::2], aspect='auto', origin='lower')
 plt.colorbar()
 plt.title("Activation matrix H")
 plt.xlabel("Time frames")
 plt.ylabel("Pitch / Component index")
 plt.show()
 
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.signal import medfilt
+from scipy.ndimage import gaussian_filter1d, binary_opening, binary_closing, label
+from scipy.ndimage import generate_binary_structure
+
+
+def clean_H_median(H, t_kernel=9, p_kernel=3):
+    return medfilt(H, kernel_size=(p_kernel, t_kernel))
+
 def note_tracking(H,th=1.5):
   mean = np.mean(H)
   std = np.std(H)
   thresh = mean + th * std
+  print(thresh)
   H_copy = np.zeros(H.shape)
   for i in range(H.shape[1]):
     indicies = np.where(H[:,i] > thresh)
     H_copy[indicies,i] = 1
   return H_copy
-
-H_est_vis = note_tracking(H_est_visualisation)
+def remove_short_events(H, min_len=10):
+    H2 = H.copy()
+    for k in range(H.shape[0]):
+        active = np.where(H[k] > 0)[0]
+        if len(active) == 0:
+            continue
+        runs = np.split(active, np.where(np.diff(active) != 1)[0] + 1)
+        for r in runs:
+            if len(r) < min_len:
+                H2[k, r] = 0
+    return H2
+def pitch_support_filter(H, min_neighbors=1):
+    H2 = H.copy()
+    for k in range(1, H.shape[0]-1):
+        support = H[k-1] + H[k] + H[k+1]
+        H2[k, support < min_neighbors] = 0
+    return H2
+#res = pitch_support_filter(remove_short_events(note_tracking(H_est[1::2])))
+#res = remove_short_events(note_tracking(H_est[1::2]))
+H_new = H_est[1::2].copy()
+res = note_tracking(H_new)
+#print(res[0].shape)
+#H_est_vis = note_tracking_simple(H_est)
 plt.figure()
-plt.imshow(H_est_vis,aspect='auto', origin='lower')
+#plt.imshow(H_est[1::2,],aspect='auto', origin='lower')
+plt.imshow(res,aspect='auto', origin='lower')
 plt.colorbar()
 plt.title("Activation matrix H")
 plt.xlabel("Time frames")
