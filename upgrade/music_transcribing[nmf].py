@@ -13,6 +13,10 @@ Original file is located at
 
 pip install nimfa
 
+!grep -rl "np.mat" /usr/local/lib/python3.12/dist-packages/nimfa | xargs sed -i 's/np.mat/np.asmatrix/g'
+!grep -rl "asmatrixrix" /usr/local/lib/python3.12/dist-packages/nimfa | xargs sed -i 's/asmatrixrix/asmatrix/g'
+!grep -R "asmatrixrix" /usr/local/lib/python3.12/dist-packages/nimfa
+
 """**Читаем исходный файл**"""
 
 from scipy.io import wavfile
@@ -163,16 +167,16 @@ from scipy.ndimage import generate_binary_structure
 def clean_H_median(H, t_kernel=9, p_kernel=3):
     return medfilt(H, kernel_size=(p_kernel, t_kernel))
 
-def note_tracking(H,th=1.5):
-  mean = np.mean(H)
-  std = np.std(H)
-  thresh = mean + th * std
-  print(thresh)
-  H_copy = np.zeros(H.shape)
-  for i in range(H.shape[1]):
-    indicies = np.where(H[:,i] > thresh)
-    H_copy[indicies,i] = 1
-  return H_copy
+def note_tracking_percentile(H, q=85):
+    H = np.asarray(H)  # CRITICAL
+    H_bin = np.zeros(H.shape, dtype=np.uint8)
+
+    for p in range(H.shape[0]):
+        row = H[p].ravel()              # ensure 1D
+        thresh = np.percentile(row, q)
+        H_bin[p] = row > thresh
+
+    return H_bin
 def remove_short_events(H, min_len=10):
     H2 = H.copy()
     for k in range(H.shape[0]):
@@ -193,7 +197,7 @@ def pitch_support_filter(H, min_neighbors=1):
 #res = pitch_support_filter(remove_short_events(note_tracking(H_est[1::2])))
 #res = remove_short_events(note_tracking(H_est[1::2]))
 H_new = H_est[1::2].copy()
-res = note_tracking(H_new)
+res = note_tracking_percentile(H_new)
 #print(res[0].shape)
 #H_est_vis = note_tracking_simple(H_est)
 plt.figure()
@@ -213,3 +217,101 @@ print(f"Estimated tempo: {tempo:.2f} BPM")
 
 beat_times = librosa.frames_to_time(beats, sr=f_s)
 print(f"Beat positions (sec.): {beat_times}")
+
+"""# Попробуем готовый NMFD"""
+
+from scipy.io import wavfile
+import numpy as np
+import librosa
+from convolutive_MM import convlutive_MM
+import torch
+from torchnmf.nmf import NMFD
+gamma = 1
+f_s, x = wavfile.read("/content/FChopinPreludeOp28n4.wav")
+if(x.dtype==np.int32):
+  x = x / (2**31)
+elif(x.dtype==np.int16):
+  x = x / (2**15)
+else:
+  raise ValueError(f"Unsupported sample type: {x.dtype}")
+X = np.abs(librosa.stft(x, n_fft=2048,hop_length=1024))
+print(f_s)        # sample rate
+print(x.dtype)   # int16, int32, etc.
+print(x.shape)   # (N,) mono or (N, channels)
+print(x[100000])
+def cnmf(V, n_components=8, n_lags=10, n_iter=100, eps=1e-9):
+    """
+    V: (F, T) non-negative matrix (e.g. magnitude spectrogram)
+    W: (F, K, L)
+    H: (K, T)
+    """
+    F, T = V.shape
+    K = n_components
+    L = n_lags
+
+    # initialize
+    W = np.random.rand(F, K, L)
+    H = np.random.rand(K, T)
+
+    for it in range(n_iter):
+        print("Iteration number:",it)
+        # reconstruct V_hat
+        V_hat = np.zeros_like(V)
+        for k in range(K):
+            for l in range(L):
+                V_hat[:, l:] += np.outer(W[:, k, l], H[k, :-l or None])
+
+        # update H
+        for k in range(K):
+            num = np.zeros(T)
+            den = np.zeros(T) + eps
+            for l in range(L):
+                Wkl = W[:, k, l][:, None]
+                num[l:] += (Wkl * V[:, l:]).sum(axis=0)
+                den[l:] += (Wkl * V_hat[:, l:]).sum(axis=0)
+            H[k] *= num / den
+
+        # update W
+        for k in range(K):
+            for l in range(L):
+                num = (V[:, l:] * H[k, :-l or None]).sum(axis=1)
+                den = (V_hat[:, l:] * H[k, :-l or None]).sum(axis=1) + eps
+                W[:, k, l] *= num / den
+
+        if it % 10 == 0:
+            err = np.linalg.norm(V - V_hat)
+            print(f"iter {it:3d} | error {err:.3f}")
+
+    return W, H
+#res = cnmf(X,88,10,100,eps=1e-9)
+S = torch.from_numpy(X).float().unsqueeze(0)
+model = NMFD(S.shape, rank=88, T=10)  # rank = components, T = time lags
+model.fit(S, max_iter=100)
+# Extract factors
+W = model.W.detach().cpu().numpy()  # (F, rank, T)
+H = model.H.detach().cpu().numpy()  # (batch, rank, time)
+
+# Remove batch dimension from H
+H = H[0]
+
+pip install torchnmf
+
+print(H.shape)
+print(H[:,100])
+
+import matplotlib.pyplot as plt
+
+vmax = np.percentile(H, 99)
+
+plt.figure(figsize=(10,4))
+plt.imshow(
+    H,
+    aspect='auto',
+    origin='lower',
+    cmap='magma',
+    vmin=0,
+    vmax=vmax
+)
+plt.colorbar()
+plt.title("CNMF activations (H) – clipped at 99th percentile")
+plt.show()
