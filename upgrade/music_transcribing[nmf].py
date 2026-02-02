@@ -180,6 +180,8 @@ def note_tracking(H,th=1.5):
     indicies = np.where(H[:,i] > thresh)
     H_copy[indicies,i] = 1
   return H_copy
+from scipy.ndimage import gaussian_filter1d
+H_n = gaussian_filter1d(H_n, sigma=1.0, axis=1)
 H_s = note_tracking(H_n)
 plt.figure()
 #plt.imshow(np.log(1+200*H_est[1::2]), aspect='auto', origin='lower')
