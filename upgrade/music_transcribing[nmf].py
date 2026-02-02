@@ -24,6 +24,7 @@ import numpy as np
 import librosa
 import nimfa
 gamma = 1
+fft_bins = 2048
 f_s, x = wavfile.read("/content/FChopinPreludeOp28n4.wav")
 print(f_s)        # sample rate
 print(x.dtype)   # int16, int32, etc.
@@ -102,15 +103,15 @@ elif(x.dtype==np.int16):
   x = x / (2**15)
 else:
   raise ValueError(f"Unsupported sample type: {x.dtype}")
-spectrogram = np.abs(librosa.stft(x, n_fft=2048,hop_length=1024))
+spectrogram = np.abs(librosa.stft(x, n_fft=fft_bins,hop_length=512))
 spectrogram_compressed = np.log(1+gamma*spectrogram)
 print(x[100000])
 print(np.min(spectrogram_compressed),np.max(spectrogram_compressed))
 print(spectrogram_compressed.shape)
 pitches = [x+21 for x in range(88)]
-freq_res = f_s/(2 * 1025)
+freq_res = f_s/(2 * (fft_bins//2+1))
 print(freq_res)
-W_temp = init_nmf_template_pitch_onset(1025,pitches,freq_res)
+W_temp = init_nmf_template_pitch_onset(fft_bins//2+1,pitches,freq_res)
 H_temp = np.random.rand(88*2, spectrogram_compressed.shape[1])
 #nmf = nimfa.Nmf(spectrogram_compressed, seed='fixed', W=W_temp)
 nmf = nimfa.Nmf(
@@ -149,8 +150,40 @@ b, a = butter(2, 0.1)   # low-pass along time
 #H_est_visualisation = filtfilt(b, a, H_est, axis=1)
 #H_est_visualisation = np.log(1+10*H_est[1::2,:])
 #H_est_visualisation = filtfilt(b, a, H_est_visualisation, axis=1)
+#print(H_est[1::2].shape)
+#print(np.percentile(H_est[1::2],95))
+H_n = np.log(1+100*H_est[1::2])
+'''def note_tracking(H,threshold=2e-2):
+  H_res = np.zeros(H.shape)
+  print(type(H))
+  print(H.shape)
+  for q in range(H.shape[0]):
+    for t in range(H.shape[1]):
+      h_qt = 0
+      for j in range(-10,11):
+        if((t+j)>=0 and (t+j)<=(H.shape[1]-1)):
+          h_qt += H[q,t+j]
+          #print("q=",q)
+          #print("t+j=",t+j)
+          #print("h_qt=",h_qt)
+      #print("h_qt=",h_qt)
+      h_qt = h_qt / 21 + threshold
+      if(H[q,t]>h_qt):
+        H_res[q,t] = 1
+  return H_res'''
+def note_tracking(H,th=1.5):
+  mean = np.mean(H)
+  std = np.std(H)
+  thresh = mean + th * std
+  H_copy = np.zeros(H.shape)
+  for i in range(H.shape[1]):
+    indicies = np.where(H[:,i] > thresh)
+    H_copy[indicies,i] = 1
+  return H_copy
+H_s = note_tracking(H_n)
 plt.figure()
-plt.imshow(H_est[1::2], aspect='auto', origin='lower')
+#plt.imshow(np.log(1+200*H_est[1::2]), aspect='auto', origin='lower')
+plt.imshow(H_s, aspect='auto', origin='lower')
 plt.colorbar()
 plt.title("Activation matrix H")
 plt.xlabel("Time frames")
@@ -315,3 +348,8 @@ plt.imshow(
 plt.colorbar()
 plt.title("CNMF activations (H) – clipped at 99th percentile")
 plt.show()
+
+"""# Пробуем CNMF (имплементация из libnmfd)"""
+
+pip install libnmfd
+
