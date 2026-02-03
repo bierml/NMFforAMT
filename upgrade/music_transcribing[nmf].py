@@ -25,12 +25,12 @@ import librosa
 import nimfa
 gamma = 1
 fft_bins = 2048
-f_s, x = wavfile.read("/content/FChopinPreludeOp28n4.wav")
+f_s, x = wavfile.read("/content/FMP_C8_F27_Chopin_Op028-04.wav")
 print(f_s)        # sample rate
 print(x.dtype)   # int16, int32, etc.
 print(x.shape)   # (N,) mono or (N, channels)
 print(x[100000])
-'''def init_nmf_template_pitch(K, pitch_set, freq_res, tol_pitch=0.05):
+def init_nmf_template_pitch(K, pitch_set, freq_res, tol_pitch=0.05):
     """Initializes template matrix for a given set of pitches
 
     Notebook: C8/C8S3_NMFSpecFac.ipynb
@@ -48,8 +48,8 @@ print(x[100000])
     W = np.zeros((K, R))
     for r in range(R):
         W[:, r] = template_pitch(K, pitch_set[r], freq_res, tol_pitch=tol_pitch)
-    return W'''
-def init_nmf_template_pitch_onset(K, pitch_set, freq_res, tol_pitch=0.05):
+    return W
+'''def init_nmf_template_pitch_onset(K, pitch_set, freq_res, tol_pitch=0.05):
     """Initializes template matrix with onsets for a given set of pitches
 
     Notebook: C8/C8S3_NMFSpecFac.ipynb
@@ -68,7 +68,7 @@ def init_nmf_template_pitch_onset(K, pitch_set, freq_res, tol_pitch=0.05):
     for r in range(R):
         W[:, 2*r] = 0.1
         W[:, 2*r+1] = template_pitch(K, pitch_set[r], freq_res, tol_pitch=tol_pitch)
-    return W
+    return W'''
 def template_pitch(K, pitch, freq_res, tol_pitch=0.05):
     """Defines spectral template for a given pitch
 
@@ -109,14 +109,14 @@ print(x[100000])
 print(np.min(spectrogram_compressed),np.max(spectrogram_compressed))
 print(spectrogram_compressed.shape)
 pitches = [x+21 for x in range(88)]
-freq_res = f_s/(2 * (fft_bins//2+1))
+freq_res = f_s/(fft_bins)
 print(freq_res)
-W_temp = init_nmf_template_pitch_onset(fft_bins//2+1,pitches,freq_res)
-H_temp = np.random.rand(88*2, spectrogram_compressed.shape[1])
+W_temp = init_nmf_template_pitch(fft_bins//2+1,pitches,freq_res)
+H_temp = np.random.rand(88, spectrogram_compressed.shape[1])
 #nmf = nimfa.Nmf(spectrogram_compressed, seed='fixed', W=W_temp)
 nmf = nimfa.Nmf(
     spectrogram_compressed,
-    rank=88*2,
+    rank=88,
     seed='fixed',
     W=W_temp,
     H=H_temp,
@@ -126,19 +126,6 @@ nmf = nimfa.Nmf(
 nmf_fit = nmf()
 W_est = nmf_fit.basis()
 H_est = nmf_fit.coef()
-
-m = template_pitch(K=1025,pitch=69,freq_res=1)
-print(type(m))
-print(np.max(m))
-
-pitches = [x+21 for x in range(88)]
-print(pitches)
-
-!grep -rl "np.mat" /usr/local/lib/python3.12/dist-packages/nimfa | xargs sed -i 's/np.mat/np.asmatrix/g'
-
-!grep -rl "asmatrixrix" /usr/local/lib/python3.12/dist-packages/nimfa | xargs sed -i 's/asmatrixrix/asmatrix/g'
-
-!grep -R "asmatrixrix" /usr/local/lib/python3.12/dist-packages/nimfa
 
 #print(W_est.shape)
 #print(H_est[:,100])
@@ -152,7 +139,7 @@ b, a = butter(2, 0.1)   # low-pass along time
 #H_est_visualisation = filtfilt(b, a, H_est_visualisation, axis=1)
 #print(H_est[1::2].shape)
 #print(np.percentile(H_est[1::2],95))
-H_n = np.log(1+100*H_est[1::2])
+H_n = np.log(1+H_est)
 '''def note_tracking(H,threshold=2e-2):
   H_res = np.zeros(H.shape)
   print(type(H))
@@ -181,11 +168,11 @@ def note_tracking(H,th=1.5):
     H_copy[indicies,i] = 1
   return H_copy
 from scipy.ndimage import gaussian_filter1d
-H_n = gaussian_filter1d(H_n, sigma=1.0, axis=1)
+#H_n = gaussian_filter1d(H_n, sigma=1.0, axis=1)
 H_s = note_tracking(H_n)
 plt.figure()
 #plt.imshow(np.log(1+200*H_est[1::2]), aspect='auto', origin='lower')
-plt.imshow(H_s, aspect='auto', origin='lower')
+plt.imshow(H_est, aspect='auto', origin='lower')
 plt.colorbar()
 plt.title("Activation matrix H")
 plt.xlabel("Time frames")
@@ -355,3 +342,22 @@ plt.show()
 
 pip install libnmfd
 
+
+
+"""# Обнаружение начал нот (Onsets detection)
+
+Будем использовать подход, называемый Spectral Difference, вычисляя результат по формуле вот отсюда: https://www.iro.umontreal.ca/~pift6080/H09/documents/presentations/xavier_bello_tutorial.pdf
+"""
+
+def H(x):
+  return (x+abs(x))/2
+def summf(v1,v2):
+  #v1 - spectral coefficients vector at moment n
+  #v2 - spectral coefficients vector at moment (n+1)
+  l = v1.shape[0]
+  assert l == v2.shape[0]
+  s = 0
+  for i in range(l):
+    s += (H(v2[i]-v1[i]))**2
+  return s
+H(5)
