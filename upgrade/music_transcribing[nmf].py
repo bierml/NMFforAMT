@@ -103,7 +103,7 @@ elif(x.dtype==np.int16):
   x = x / (2**15)
 else:
   raise ValueError(f"Unsupported sample type: {x.dtype}")
-spectrogram = np.abs(librosa.stft(x, n_fft=fft_bins,hop_length=512))
+spectrogram = np.abs(librosa.stft(x, n_fft=fft_bins,hop_length=1024))
 spectrogram_compressed = np.log(1+gamma*spectrogram)
 print(x[100000])
 print(np.min(spectrogram_compressed),np.max(spectrogram_compressed))
@@ -168,11 +168,11 @@ def note_tracking(H,th=1.5):
     H_copy[indicies,i] = 1
   return H_copy
 from scipy.ndimage import gaussian_filter1d
-#H_n = gaussian_filter1d(H_n, sigma=1.0, axis=1)
+H_n = gaussian_filter1d(H_n, sigma=1.0, axis=1)
 H_s = note_tracking(H_n)
 plt.figure()
 #plt.imshow(np.log(1+200*H_est[1::2]), aspect='auto', origin='lower')
-plt.imshow(H_est, aspect='auto', origin='lower')
+plt.imshow(H_s, aspect='auto', origin='lower')
 plt.colorbar()
 plt.title("Activation matrix H")
 plt.xlabel("Time frames")
@@ -360,4 +360,18 @@ def summf(v1,v2):
   for i in range(l):
     s += (H(v2[i]-v1[i]))**2
   return s
+def spec_diff(sp):
+  res = []
+  for i in range(sp.shape[1]-1):
+    res.append(float(summf(sp[:,i],sp[:,i+1])))
+  return res
 H(5)
+import matplotlib.pyplot as plt
+
+data = spec_diff(spectrogram_compressed)
+
+plt.plot(data)
+plt.xlabel("Index")
+plt.ylabel("Value")
+plt.title("Line plot of list")
+plt.show()
