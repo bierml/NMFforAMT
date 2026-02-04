@@ -366,11 +366,29 @@ def spec_diff(sp):
     res.append(float(summf(sp[:,i],sp[:,i+1])))
   return res
 H(5)
+def eval_thrshld(d,n,M=100,abs_thrsh=0.1,lam=1.0):
+  r = abs_thrsh
+  n_s = n-M
+  n_f = n+M
+  if(n<M):
+    n_s = M
+  if(n+M>=len(d)):
+    n_f = len(d)
+  r += lam * np.median(d[n_s:n_f])
+  return r
+def peak_detect(data):
+  res = np.zeros((len(data),))
+  lval = 0
+  for i in range(len(data)):
+    if(data[i]>=eval_thrshld(data,i) and (i-lval)>=20):
+      res[i] = 1
+      lval = i
+  return res
 import matplotlib.pyplot as plt
 
 data = spec_diff(spectrogram_compressed)
-
-plt.plot(data)
+fin = peak_detect(data)
+plt.plot(fin)
 plt.xlabel("Index")
 plt.ylabel("Value")
 plt.title("Line plot of list")
