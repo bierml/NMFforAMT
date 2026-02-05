@@ -393,3 +393,50 @@ plt.xlabel("Index")
 plt.ylabel("Value")
 plt.title("Line plot of list")
 plt.show()
+
+import numpy as np
+def shift_right(x, k):
+    if(k==0):
+      return x
+    y = np.zeros_like(x)
+    y[k:] = x[:-k]
+    return y
+def note_template(pitch, alpha=0.5):
+  r = np.zeros((88,))
+  #first eight harmonics of some pitch
+  l = [0,12,19,24,28,31,34,36]
+  r[l]=1
+  #print(pitch)
+  r = shift_right(r,pitch)
+  return r
+def top_k_indices(v, k):
+    return np.argsort(v)[-k:][::-1]
+def rms(x):
+    return np.sqrt(np.mean(np.square(x)))
+def process_frame(s,k=9,en_thrsh=0.4):
+    assert s.shape[0] == 88 and s.shape[1] == 1
+    notes = []
+    s_c = s.copy()
+    s_c = np.asarray(s, dtype=float).squeeze()
+    print(type(s_c))
+    print("s_c=",s_c)
+    s_pitches = top_k_indices(s_c,k)
+    print("s_pitches=",s_pitches)
+    for l in s_pitches:
+      #print(l)
+      r = rms(np.dot(note_template(l),s_c))
+      print("r=",r)
+      if(r>en_thrsh):
+        notes.append(int(l))
+    return notes
+
+H_n = np.log(1+H_est)
+print(H_n[:,100].shape)
+print("results: ",process_frame(H_n[:,100]))
+
+print(note_template(0))
+
+v=[3,7,5,2,7,8,9,1,2,3,5,6,7,8,9,2,]
+def top_k_indices(v, k):
+    return np.argsort(v)[-k:][::-1]
+print(top_k_indices(v, 9))
