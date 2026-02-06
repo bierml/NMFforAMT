@@ -386,14 +386,6 @@ def peak_detect(data):
   return res
 import matplotlib.pyplot as plt
 
-data = spec_diff(spectrogram_compressed)
-fin = peak_detect(data)
-plt.plot(fin)
-plt.xlabel("Index")
-plt.ylabel("Value")
-plt.title("Line plot of list")
-plt.show()
-
 import numpy as np
 def shift_right(x, k):
     if(k==0):
@@ -413,26 +405,46 @@ def top_k_indices(v, k):
     return np.argsort(v)[-k:][::-1]
 def rms(x):
     return np.sqrt(np.mean(np.square(x)))
-def process_frame(s,k=9,en_thrsh=0.4):
+def process_frame(s,k=3,en_thrsh=0.4):
     assert s.shape[0] == 88 and s.shape[1] == 1
     notes = []
     s_c = s.copy()
     s_c = np.asarray(s, dtype=float).squeeze()
-    print(type(s_c))
-    print("s_c=",s_c)
+    #print(type(s_c))
+    #print("s_c=",s_c)
     s_pitches = top_k_indices(s_c,k)
-    print("s_pitches=",s_pitches)
+    #print("s_pitches=",s_pitches)
     for l in s_pitches:
       #print(l)
       r = rms(np.dot(note_template(l),s_c))
-      print("r=",r)
+      #print("r=",r)
       if(r>en_thrsh):
         notes.append(int(l))
     return notes
+def note_tracking(mtr):
+  r = np.zeros(mtr.shape)
+  for i in range(mtr.shape[1]):
+    ind = process_frame(mtr[:,i])
+    for k in ind:
+      r[k,i] = 1
+  return r
 
 H_n = np.log(1+H_est)
+print(H_n.shape)
+H_n = note_tracking(H_est)
+print(H_n.shape)
 print(H_n[:,100].shape)
-print("results: ",process_frame(H_n[:,100]))
+
+plt.figure()
+#plt.imshow(np.log(1+200*H_est[1::2]), aspect='auto', origin='lower')
+plt.imshow(H_n, aspect='auto', origin='lower')
+plt.colorbar()
+plt.title("Activation matrix H")
+plt.xlabel("Time frames")
+plt.ylabel("Pitch / Component index")
+plt.show()
+
+print(H_s.shape)
 
 print(note_template(0))
 
