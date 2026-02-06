@@ -23,14 +23,14 @@ from scipy.io import wavfile
 import numpy as np
 import librosa
 import nimfa
-gamma = 1
+gamma = 100
 fft_bins = 2048
 f_s, x = wavfile.read("/content/FMP_C8_F27_Chopin_Op028-04.wav")
 print(f_s)        # sample rate
 print(x.dtype)   # int16, int32, etc.
 print(x.shape)   # (N,) mono or (N, channels)
 print(x[100000])
-def init_nmf_template_pitch(K, pitch_set, freq_res, tol_pitch=0.05):
+'''def init_nmf_template_pitch(K, pitch_set, freq_res, tol_pitch=0.05):
     """Initializes template matrix for a given set of pitches
 
     Notebook: C8/C8S3_NMFSpecFac.ipynb
@@ -48,8 +48,8 @@ def init_nmf_template_pitch(K, pitch_set, freq_res, tol_pitch=0.05):
     W = np.zeros((K, R))
     for r in range(R):
         W[:, r] = template_pitch(K, pitch_set[r], freq_res, tol_pitch=tol_pitch)
-    return W
-'''def init_nmf_template_pitch_onset(K, pitch_set, freq_res, tol_pitch=0.05):
+    return W'''
+def init_nmf_template_pitch_onset(K, pitch_set, freq_res, tol_pitch=0.05):
     """Initializes template matrix with onsets for a given set of pitches
 
     Notebook: C8/C8S3_NMFSpecFac.ipynb
@@ -68,7 +68,7 @@ def init_nmf_template_pitch(K, pitch_set, freq_res, tol_pitch=0.05):
     for r in range(R):
         W[:, 2*r] = 0.1
         W[:, 2*r+1] = template_pitch(K, pitch_set[r], freq_res, tol_pitch=tol_pitch)
-    return W'''
+    return W
 def template_pitch(K, pitch, freq_res, tol_pitch=0.05):
     """Defines spectral template for a given pitch
 
@@ -104,19 +104,19 @@ elif(x.dtype==np.int16):
 else:
   raise ValueError(f"Unsupported sample type: {x.dtype}")
 spectrogram = np.abs(librosa.stft(x, n_fft=fft_bins,hop_length=1024))
-spectrogram_compressed = np.log(1+gamma*spectrogram)
+spectrogram_compressed = np.log(1+spectrogram)
 print(x[100000])
 print(np.min(spectrogram_compressed),np.max(spectrogram_compressed))
 print(spectrogram_compressed.shape)
 pitches = [x+21 for x in range(88)]
-freq_res = f_s/(fft_bins)
+freq_res = f_s/(2 * (fft_bins/2+1))
 print(freq_res)
-W_temp = init_nmf_template_pitch(fft_bins//2+1,pitches,freq_res)
-H_temp = np.random.rand(88, spectrogram_compressed.shape[1])
+W_temp = init_nmf_template_pitch_onset(fft_bins//2+1,pitches,freq_res)
+H_temp = np.random.rand(88*2, spectrogram_compressed.shape[1])
 #nmf = nimfa.Nmf(spectrogram_compressed, seed='fixed', W=W_temp)
 nmf = nimfa.Nmf(
     spectrogram_compressed,
-    rank=88,
+    rank=88*2,
     seed='fixed',
     W=W_temp,
     H=H_temp,
@@ -127,37 +127,74 @@ nmf_fit = nmf()
 W_est = nmf_fit.basis()
 H_est = nmf_fit.coef()
 
-#print(W_est.shape)
-#print(H_est[:,100])
-import matplotlib.pyplot as plt
-#H_est_visualisation = np.log(1+10*H_est)
-from scipy.signal import butter, filtfilt
+H_new = H_est[1::2].copy()
+import numpy as np
+from scipy.ndimage import uniform_filter1d, maximum_filter1d
 
-b, a = butter(2, 0.1)   # low-pass along time
-#H_est_visualisation = filtfilt(b, a, H_est, axis=1)
-#H_est_visualisation = np.log(1+10*H_est[1::2,:])
-#H_est_visualisation = filtfilt(b, a, H_est_visualisation, axis=1)
-#print(H_est[1::2].shape)
-#print(np.percentile(H_est[1::2],95))
-H_n = np.log(1+H_est)
-'''def note_tracking(H,threshold=2e-2):
-  H_res = np.zeros(H.shape)
-  print(type(H))
-  print(H.shape)
-  for q in range(H.shape[0]):
-    for t in range(H.shape[1]):
-      h_qt = 0
-      for j in range(-10,11):
-        if((t+j)>=0 and (t+j)<=(H.shape[1]-1)):
-          h_qt += H[q,t+j]
-          #print("q=",q)
-          #print("t+j=",t+j)
-          #print("h_qt=",h_qt)
-      #print("h_qt=",h_qt)
-      h_qt = h_qt / 21 + threshold
-      if(H[q,t]>h_qt):
-        H_res[q,t] = 1
-  return H_res'''
+def note_tracking_hysteresis(
+    H,
+    smooth_time=9,
+    pitch_neighborhood=2,
+    z_on=1.2,
+    z_off=0.4
+):
+    from scipy.ndimage import uniform_filter1d, maximum_filter1d
+
+    H = np.asarray(H, float)
+    Q, T = H.shape
+
+    # smooth in time
+    Hs = uniform_filter1d(H, size=smooth_time, axis=1)
+
+    # z-score per pitch
+    mu = Hs.mean(axis=1, keepdims=True)
+    sigma = Hs.std(axis=1, keepdims=True) + 1e-8
+    Hz = (Hs - mu) / sigma
+
+    # local pitch competition
+    Hmax = maximum_filter1d(
+        Hz, size=2*pitch_neighborhood+1, axis=0
+    )
+
+    active = np.zeros_like(Hz, dtype=np.uint8)
+
+    for q in range(Q):
+        on = False
+        for t in range(T):
+            if not on:
+                if Hz[q, t] > z_on and Hz[q, t] == Hmax[q, t]:
+                    on = True
+            else:
+                if Hz[q, t] < z_off:
+                    on = False
+            active[q, t] = on
+
+    return active
+
+def enforce_min_duration(B, min_len=10):
+    for q in range(B.shape[0]):
+        labels, n = label(B[q])
+        for i in range(1, n+1):
+            if np.sum(labels == i) < min_len:
+                B[q][labels == i] = 0
+    return B
+
+B = note_tracking_hysteresis(
+    H_new,
+    smooth_time=15,
+    pitch_neighborhood=1,
+    z_on=1.0,
+    z_off=0.2
+)
+B = enforce_min_duration(B)
+plt.figure()
+plt.imshow(B,aspect='auto', origin='lower')
+plt.colorbar()
+plt.title("Activation matrix H")
+plt.xlabel("Time frames")
+plt.ylabel("Pitch / Component index")
+plt.show()
+
 def note_tracking(H,th=1.5):
   mean = np.mean(H)
   std = np.std(H)
@@ -167,64 +204,10 @@ def note_tracking(H,th=1.5):
     indicies = np.where(H[:,i] > thresh)
     H_copy[indicies,i] = 1
   return H_copy
-from scipy.ndimage import gaussian_filter1d
-H_n = gaussian_filter1d(H_n, sigma=1.0, axis=1)
-H_s = note_tracking(H_n)
+
+H_est_vis = note_tracking(H_est_visualisation)
 plt.figure()
-#plt.imshow(np.log(1+200*H_est[1::2]), aspect='auto', origin='lower')
-plt.imshow(H_s, aspect='auto', origin='lower')
-plt.colorbar()
-plt.title("Activation matrix H")
-plt.xlabel("Time frames")
-plt.ylabel("Pitch / Component index")
-plt.show()
-
-import numpy as np
-import matplotlib.pyplot as plt
-from scipy.signal import medfilt
-from scipy.ndimage import gaussian_filter1d, binary_opening, binary_closing, label
-from scipy.ndimage import generate_binary_structure
-
-
-def clean_H_median(H, t_kernel=9, p_kernel=3):
-    return medfilt(H, kernel_size=(p_kernel, t_kernel))
-
-def note_tracking_percentile(H, q=85):
-    H = np.asarray(H)  # CRITICAL
-    H_bin = np.zeros(H.shape, dtype=np.uint8)
-
-    for p in range(H.shape[0]):
-        row = H[p].ravel()              # ensure 1D
-        thresh = np.percentile(row, q)
-        H_bin[p] = row > thresh
-
-    return H_bin
-def remove_short_events(H, min_len=10):
-    H2 = H.copy()
-    for k in range(H.shape[0]):
-        active = np.where(H[k] > 0)[0]
-        if len(active) == 0:
-            continue
-        runs = np.split(active, np.where(np.diff(active) != 1)[0] + 1)
-        for r in runs:
-            if len(r) < min_len:
-                H2[k, r] = 0
-    return H2
-def pitch_support_filter(H, min_neighbors=1):
-    H2 = H.copy()
-    for k in range(1, H.shape[0]-1):
-        support = H[k-1] + H[k] + H[k+1]
-        H2[k, support < min_neighbors] = 0
-    return H2
-#res = pitch_support_filter(remove_short_events(note_tracking(H_est[1::2])))
-#res = remove_short_events(note_tracking(H_est[1::2]))
-H_new = H_est[1::2].copy()
-res = note_tracking_percentile(H_new)
-#print(res[0].shape)
-#H_est_vis = note_tracking_simple(H_est)
-plt.figure()
-#plt.imshow(H_est[1::2,],aspect='auto', origin='lower')
-plt.imshow(res,aspect='auto', origin='lower')
+plt.imshow(H_est_vis,aspect='auto', origin='lower')
 plt.colorbar()
 plt.title("Activation matrix H")
 plt.xlabel("Time frames")
@@ -438,6 +421,47 @@ print(H_n[:,100].shape)
 plt.figure()
 #plt.imshow(np.log(1+200*H_est[1::2]), aspect='auto', origin='lower')
 plt.imshow(H_n, aspect='auto', origin='lower')
+plt.colorbar()
+plt.title("Activation matrix H")
+plt.xlabel("Time frames")
+plt.ylabel("Pitch / Component index")
+plt.show()
+
+def note_tracking_paper_style(H, delta=0.1, win=10):
+    Q, T = H.shape
+    R = np.zeros_like(H, dtype=np.uint8)
+
+    # 1. Per-pitch normalization (critical)
+    Hn = H / (np.max(H, axis=1, keepdims=True) + 1e-9)
+
+    for q in range(Q):
+        for t in range(T):
+
+            # local mean (zero-padded)
+            t0 = max(0, t - win)
+            t1 = min(T, t + win + 1)
+            local_mean = np.mean(Hn[q, t0:t1])
+
+            # adaptive threshold
+            thresh = local_mean + delta
+
+            # onset condition (THIS is what you missed)
+            if (
+                Hn[q, t] > thresh and
+                (t == 0 or Hn[q, t] > Hn[q, t - 1])
+            ):
+                R[q, t] = 1
+
+    return R
+H_n = np.log(1+H_est)
+print(H_n.shape)
+H_n = note_tracking(H_n)
+print(H_n.shape)
+print(H_n[:,100].shape)
+
+plt.figure()
+#plt.imshow(np.log(1+200*H_est[1::2]), aspect='auto', origin='lower')
+plt.imshow(H_est, aspect='auto', origin='lower')
 plt.colorbar()
 plt.title("Activation matrix H")
 plt.xlabel("Time frames")
