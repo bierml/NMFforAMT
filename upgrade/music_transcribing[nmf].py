@@ -104,15 +104,73 @@ elif(x.dtype==np.int16):
 else:
   raise ValueError(f"Unsupported sample type: {x.dtype}")
 spectrogram = np.abs(librosa.stft(x, n_fft=fft_bins,hop_length=1024))
-spectrogram_compressed = np.log(1+spectrogram)
+spectrogram_compressed = np.log(1+gamma*spectrogram)
 print(x[100000])
 print(np.min(spectrogram_compressed),np.max(spectrogram_compressed))
 print(spectrogram_compressed.shape)
 pitches = [x+21 for x in range(88)]
-freq_res = f_s/(2 * (fft_bins/2+1))
+#pitches = [x for x in range(62,85)]
+freq_res = f_s/(2 * (fft_bins//2+1))
 print(freq_res)
+def H(x):
+  return (x+abs(x))/2
+def summf(v1,v2):
+  #v1 - spectral coefficients vector at moment n
+  #v2 - spectral coefficients vector at moment (n+1)
+  l = v1.shape[0]
+  assert l == v2.shape[0]
+  s = 0
+  for i in range(l):
+    s += (H(v2[i]-v1[i]))**2
+  return s
+def spec_diff(sp):
+  res = []
+  for i in range(sp.shape[1]-1):
+    res.append(float(summf(sp[:,i],sp[:,i+1])))
+  return res
+H(5)
+def eval_thrshld(d,n,M=100,abs_thrsh=0.1,lam=1.0):
+  r = abs_thrsh
+  n_s = n-M
+  n_f = n+M
+  if(n<M):
+    n_s = M
+  if(n+M>=len(d)):
+    n_f = len(d)
+  r += lam * np.median(d[n_s:n_f])
+  return r
+'''def peak_detect(data):
+  res = np.zeros((len(data),))
+  lval = 0
+  for i in range(len(data)):
+    if(data[i]>=eval_thrshld(data,i) and (i-lval)>=20):
+      res[i] = 1
+      lval = i
+  return res'''
+def peak_detect(data):
+  #res = np.zeros((len(data),))
+  res = []
+  lval = 0
+  for i in range(len(data)):
+    if(data[i]>=eval_thrshld(data,i) and (i-lval)>=20):
+      res.append(i)
+      lval = i
+  return res
+data = spec_diff(spectrogram_compressed)
+res = peak_detect(data)
+def sparse_H(H,onsets):
+  H_r = H.copy()
+  for i in range(H_r.shape[1]):
+    if(i in onsets or (i-1) in onsets or (i+1) in onsets):
+      H[1::2,i] = 0
+    else:
+      H[0::2,i] = 0
+  return H_r
+print(res)
+import matplotlib.pyplot as plt
 W_temp = init_nmf_template_pitch_onset(fft_bins//2+1,pitches,freq_res)
 H_temp = np.random.rand(88*2, spectrogram_compressed.shape[1])
+H_temp = sparse_H(H_temp,res)
 #nmf = nimfa.Nmf(spectrogram_compressed, seed='fixed', W=W_temp)
 nmf = nimfa.Nmf(
     spectrogram_compressed,
@@ -121,80 +179,81 @@ nmf = nimfa.Nmf(
     W=W_temp,
     H=H_temp,
     max_iter=200,
-    beta=1, sparsity=(None, 0.2)
+    beta=1, sparsity=(None, 5)
 )
 nmf_fit = nmf()
 W_est = nmf_fit.basis()
 H_est = nmf_fit.coef()
 
 H_new = H_est[1::2].copy()
-import numpy as np
-from scipy.ndimage import uniform_filter1d, maximum_filter1d
 
-def note_tracking_hysteresis(
-    H,
-    smooth_time=9,
-    pitch_neighborhood=2,
-    z_on=1.2,
-    z_off=0.4
-):
-    from scipy.ndimage import uniform_filter1d, maximum_filter1d
+tempo, beats = librosa.beat.beat_track(y=x, sr=f_s)
 
-    H = np.asarray(H, float)
+tempo = float(tempo)          # or: tempo = tempo.item()
+
+print(f"Estimated tempo: {tempo:.2f} BPM")
+
+beat_times = librosa.frames_to_time(beats, sr=f_s)
+beat_frames = list(map(int, beat_times * f_s / 1024))
+print("beat_frames=",beat_frames)
+print(f"Beat positions (sec.): {beat_times}")
+
+def beat_sync_H(H, beat_frames, mode="mean"):
     Q, T = H.shape
+    B = len(beat_frames) - 1
+    H_beat = np.zeros((Q, B))
 
-    # smooth in time
-    Hs = uniform_filter1d(H, size=smooth_time, axis=1)
+    for b in range(B):
+        a, c = beat_frames[b], beat_frames[b+1]
+        if mode == "mean":
+            H_beat[:, b] = H[:, a:c].mean(axis=1)
+        else:
+            H_beat[:, b] = H[:, a:c].max(axis=1)
 
-    # z-score per pitch
-    mu = Hs.mean(axis=1, keepdims=True)
-    sigma = Hs.std(axis=1, keepdims=True) + 1e-8
-    Hz = (Hs - mu) / sigma
-
-    # local pitch competition
-    Hmax = maximum_filter1d(
-        Hz, size=2*pitch_neighborhood+1, axis=0
-    )
-
-    active = np.zeros_like(Hz, dtype=np.uint8)
-
-    for q in range(Q):
-        on = False
-        for t in range(T):
-            if not on:
-                if Hz[q, t] > z_on and Hz[q, t] == Hmax[q, t]:
-                    on = True
-            else:
-                if Hz[q, t] < z_off:
-                    on = False
-            active[q, t] = on
-
-    return active
-
-def enforce_min_duration(B, min_len=10):
-    for q in range(B.shape[0]):
-        labels, n = label(B[q])
-        for i in range(1, n+1):
-            if np.sum(labels == i) < min_len:
-                B[q][labels == i] = 0
-    return B
-
-B = note_tracking_hysteresis(
-    H_new,
-    smooth_time=15,
-    pitch_neighborhood=1,
-    z_on=1.0,
-    z_off=0.2
-)
-B = enforce_min_duration(B)
+    return H_beat
+H_v = np.log(1+100*H_new)
+#H_v = np.asarray(H_v)
+#H_v = beat_sync_H(H_v,beat_frames)
+import matplotlib.pyplot as plt
 plt.figure()
-plt.imshow(B,aspect='auto', origin='lower')
+plt.imshow(H_new, aspect='auto', origin='lower')
 plt.colorbar()
 plt.title("Activation matrix H")
 plt.xlabel("Time frames")
 plt.ylabel("Pitch / Component index")
 plt.show()
 
+H_new = H_est[1::2].copy()
+import numpy as np
+from scipy.ndimage import uniform_filter1d, maximum_filter1d
+
+plt.figure()
+plt.imshow(np.log(1+H_new),aspect='auto', origin='lower')
+plt.colorbar()
+plt.title("Activation matrix H")
+plt.xlabel("Time frames")
+plt.ylabel("Pitch / Component index")
+plt.show()
+
+#print(W_est.shape)
+#print(H_est[:,100])
+import matplotlib.pyplot as plt
+#H_est_visualisation = np.log(1+10*H_est)
+from scipy.signal import butter, filtfilt
+
+b, a = butter(2, 0.1)   # low-pass along time
+#H_est_visualisation = filtfilt(b, a, H_est, axis=1)
+H_est_visualisation = np.log(1+100*H_est[1::2,:])
+#H_est_visualisation = filtfilt(b, a, H_est_visualisation, axis=1)
+plt.figure()
+plt.imshow(H_est_visualisation, aspect='auto', origin='lower')
+plt.colorbar()
+plt.title("Activation matrix H")
+plt.xlabel("Time frames")
+plt.ylabel("Pitch / Component index")
+plt.show()
+
+H_est_visualisation = np.log(1+100*H_est[1::2,:])
 def note_tracking(H,th=1.5):
   mean = np.mean(H)
   std = np.std(H)
@@ -214,14 +273,7 @@ plt.xlabel("Time frames")
 plt.ylabel("Pitch / Component index")
 plt.show()
 
-tempo, beats = librosa.beat.beat_track(y=x, sr=f_s)
 
-tempo = float(tempo)          # or: tempo = tempo.item()
-
-print(f"Estimated tempo: {tempo:.2f} BPM")
-
-beat_times = librosa.frames_to_time(beats, sr=f_s)
-print(f"Beat positions (sec.): {beat_times}")
 
 """# Попробуем готовый NMFD"""
 
@@ -291,7 +343,7 @@ def cnmf(V, n_components=8, n_lags=10, n_iter=100, eps=1e-9):
 #res = cnmf(X,88,10,100,eps=1e-9)
 S = torch.from_numpy(X).float().unsqueeze(0)
 model = NMFD(S.shape, rank=88, T=10)  # rank = components, T = time lags
-model.fit(S, max_iter=100)
+model.fit(S, max_iter=200)
 # Extract factors
 W = model.W.detach().cpu().numpy()  # (F, rank, T)
 H = model.H.detach().cpu().numpy()  # (batch, rank, time)
@@ -359,14 +411,34 @@ def eval_thrshld(d,n,M=100,abs_thrsh=0.1,lam=1.0):
     n_f = len(d)
   r += lam * np.median(d[n_s:n_f])
   return r
-def peak_detect(data):
+'''def peak_detect(data):
   res = np.zeros((len(data),))
   lval = 0
   for i in range(len(data)):
     if(data[i]>=eval_thrshld(data,i) and (i-lval)>=20):
       res[i] = 1
       lval = i
+  return res'''
+def peak_detect(data):
+  #res = np.zeros((len(data),))
+  res = []
+  lval = 0
+  for i in range(len(data)):
+    if(data[i]>=eval_thrshld(data,i) and (i-lval)>=20):
+      res.append(i)
+      lval = i
   return res
+data = spec_diff(spectrogram_compressed)
+res = peak_detect(data)
+def sparse_H(H,onsets):
+  H_r = H.copy()
+  for i in range(H_r.shape[1]):
+    if(i in onsets or (i-1) in onsets or (i+1) in onsets):
+      H[1::2,i] = 0
+    else:
+      H[0::2,i] = 0
+  return H_r
+print(res)
 import matplotlib.pyplot as plt
 
 import numpy as np
