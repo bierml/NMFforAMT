@@ -25,7 +25,7 @@ import librosa
 import nimfa
 gamma = 100
 fft_bins = 2048
-f_s, x = wavfile.read("/content/FMP_C8_F27_Chopin_Op028-04.wav")
+f_s, x = wavfile.read("/content/FChopinPrelude28No4.wav")
 print(f_s)        # sample rate
 print(x.dtype)   # int16, int32, etc.
 print(x.shape)   # (N,) mono or (N, channels)
@@ -170,7 +170,7 @@ print(res)
 import matplotlib.pyplot as plt
 W_temp = init_nmf_template_pitch_onset(fft_bins//2+1,pitches,freq_res)
 H_temp = np.random.rand(88*2, spectrogram_compressed.shape[1])
-H_temp = sparse_H(H_temp,res)
+#H_temp = sparse_H(H_temp,res)
 #nmf = nimfa.Nmf(spectrogram_compressed, seed='fixed', W=W_temp)
 nmf = nimfa.Nmf(
     spectrogram_compressed,
@@ -222,58 +222,6 @@ plt.title("Activation matrix H")
 plt.xlabel("Time frames")
 plt.ylabel("Pitch / Component index")
 plt.show()
-
-H_new = H_est[1::2].copy()
-import numpy as np
-from scipy.ndimage import uniform_filter1d, maximum_filter1d
-
-plt.figure()
-plt.imshow(np.log(1+H_new),aspect='auto', origin='lower')
-plt.colorbar()
-plt.title("Activation matrix H")
-plt.xlabel("Time frames")
-plt.ylabel("Pitch / Component index")
-plt.show()
-
-#print(W_est.shape)
-#print(H_est[:,100])
-import matplotlib.pyplot as plt
-#H_est_visualisation = np.log(1+10*H_est)
-from scipy.signal import butter, filtfilt
-
-b, a = butter(2, 0.1)   # low-pass along time
-#H_est_visualisation = filtfilt(b, a, H_est, axis=1)
-H_est_visualisation = np.log(1+100*H_est[1::2,:])
-#H_est_visualisation = filtfilt(b, a, H_est_visualisation, axis=1)
-plt.figure()
-plt.imshow(H_est_visualisation, aspect='auto', origin='lower')
-plt.colorbar()
-plt.title("Activation matrix H")
-plt.xlabel("Time frames")
-plt.ylabel("Pitch / Component index")
-plt.show()
-
-H_est_visualisation = np.log(1+100*H_est[1::2,:])
-def note_tracking(H,th=1.5):
-  mean = np.mean(H)
-  std = np.std(H)
-  thresh = mean + th * std
-  H_copy = np.zeros(H.shape)
-  for i in range(H.shape[1]):
-    indicies = np.where(H[:,i] > thresh)
-    H_copy[indicies,i] = 1
-  return H_copy
-
-H_est_vis = note_tracking(H_est_visualisation)
-plt.figure()
-plt.imshow(H_est_vis,aspect='auto', origin='lower')
-plt.colorbar()
-plt.title("Activation matrix H")
-plt.xlabel("Time frames")
-plt.ylabel("Pitch / Component index")
-plt.show()
-
-
 
 """# Попробуем готовый NMFD"""
 
@@ -548,3 +496,30 @@ v=[3,7,5,2,7,8,9,1,2,3,5,6,7,8,9,2,]
 def top_k_indices(v, k):
     return np.argsort(v)[-k:][::-1]
 print(top_k_indices(v, 9))
+
+"""# Оценка результатов транскрибирования"""
+
+def evaluate_results(H_et,H):
+  #H_et - reference transcription of the piece
+  #H - estimated transcription of the piece
+  assert H_et.shape == H.shape
+  P = 0
+  R = 0
+  F1 = 0
+  TP = 0
+  FP = 0
+  FN = 0
+  for i in range(H_et.shape[1]):
+    TP += sum(1 for t, p in zip(H_et[:,i], H[:,i]) if t == 1 and p == 1)
+    FP += sum(1 for t, p in zip(H_et[:,i], H[:,i]) if t == 0 and p == 1)
+    FN += sum(1 for t, p in zip(H_et[:,i], H[:,i]) if t == 1 and p == 0)
+  P = TP / (TP + FP)
+  R = TP / (TP + FN)
+  F1 = 2 * P * R / (P + R)
+  return (P,R,F1)
+
+a = [0,1,1,1,0]
+b = [1,1,1,0,0]
+print(sum(1 for t, p in zip(a, b) if t == 1 and p == 1))
+
+print(TP)
