@@ -162,9 +162,9 @@ def sparse_H(H,onsets):
   H_r = H.copy()
   for i in range(H_r.shape[1]):
     if(i in onsets or (i-1) in onsets or (i+1) in onsets):
-      H[1::2,i] = 0
+      H_r[1::2,i] = 0
     else:
-      H[0::2,i] = 0
+      H_r[0::2,i] = 0
   return H_r
 print(res)
 import matplotlib.pyplot as plt
@@ -179,13 +179,15 @@ nmf = nimfa.Nmf(
     W=W_temp,
     H=H_temp,
     max_iter=200,
-    beta=1, sparsity=(None, 5)
+    beta=1, sparsity=(None, 0.2)
 )
 nmf_fit = nmf()
 W_est = nmf_fit.basis()
 H_est = nmf_fit.coef()
 
 H_new = H_est[1::2].copy()
+
+print(len(res))
 
 tempo, beats = librosa.beat.beat_track(y=x, sr=f_s)
 
@@ -197,6 +199,16 @@ beat_times = librosa.frames_to_time(beats, sr=f_s)
 beat_frames = list(map(int, beat_times * f_s / 1024))
 print("beat_frames=",beat_frames)
 print(f"Beat positions (sec.): {beat_times}")
+
+def note_tracking(H,th=1.5):
+  mean = np.mean(H)
+  std = np.std(H)
+  thresh = mean + th * std
+  H_copy = np.zeros(H.shape)
+  for i in range(H.shape[1]):
+    indicies = np.where(H[:,i] > thresh)
+    H_copy[indicies,i] = 1
+  return H_copy
 
 def beat_sync_H(H, beat_frames, mode="mean"):
     Q, T = H.shape
@@ -211,12 +223,24 @@ def beat_sync_H(H, beat_frames, mode="mean"):
             H_beat[:, b] = H[:, a:c].max(axis=1)
 
     return H_beat
+#CONTINUE HERE
+def generate_transcription(H_v,onsets):
+  H_r = np.zeros(H_v.shape)
+  mask = np.zeros(88)
+  for i in range(H_v.shape[1]):
+    if(i in onsets):
+      H_r[:,i] = H_v[:,i]
+      mask = H_r[:,i]
 H_v = np.log(1+100*H_new)
+#print(H_v.shape)
+H_v = note_tracking(H_v)
+H_v[0,:] = 0 #rough zero-ing A0 is the simplest way to approach NMF artefacts in low pitches
 #H_v = np.asarray(H_v)
 #H_v = beat_sync_H(H_v,beat_frames)
 import matplotlib.pyplot as plt
 plt.figure()
-plt.imshow(H_new, aspect='auto', origin='lower')
+#plt.imshow(H_v, aspect='auto', origin='lower')
+plt.imshow(H_est[0::2], aspect='auto', origin='lower')
 plt.colorbar()
 plt.title("Activation matrix H")
 plt.xlabel("Time frames")
@@ -432,27 +456,13 @@ def note_tracking(mtr):
       r[k,i] = 1
   return r
 
-H_n = np.log(1+H_est)
-print(H_n.shape)
-H_n = note_tracking(H_est)
-print(H_n.shape)
-print(H_n[:,100].shape)
-
-plt.figure()
-#plt.imshow(np.log(1+200*H_est[1::2]), aspect='auto', origin='lower')
-plt.imshow(H_n, aspect='auto', origin='lower')
-plt.colorbar()
-plt.title("Activation matrix H")
-plt.xlabel("Time frames")
-plt.ylabel("Pitch / Component index")
-plt.show()
-
 def note_tracking_paper_style(H, delta=0.1, win=10):
     Q, T = H.shape
     R = np.zeros_like(H, dtype=np.uint8)
 
     # 1. Per-pitch normalization (critical)
-    Hn = H / (np.max(H, axis=1, keepdims=True) + 1e-9)
+    '''keepdims=True'''
+    Hn = H / (np.max(H, axis=1) + 1e-9)
 
     for q in range(Q):
         for t in range(T):
@@ -475,13 +485,40 @@ def note_tracking_paper_style(H, delta=0.1, win=10):
     return R
 H_n = np.log(1+H_est)
 print(H_n.shape)
-H_n = note_tracking(H_n)
+#H_n = note_tracking(H_n)
 print(H_n.shape)
 print(H_n[:,100].shape)
 
 plt.figure()
 #plt.imshow(np.log(1+200*H_est[1::2]), aspect='auto', origin='lower')
-plt.imshow(H_est, aspect='auto', origin='lower')
+plt.imshow(note_tracking_paper_style(H_est), aspect='auto', origin='lower')
+plt.colorbar()
+plt.title("Activation matrix H")
+plt.xlabel("Time frames")
+plt.ylabel("Pitch / Component index")
+plt.show()
+
+
+
+def pitch_energy_compensation(H, gamma=0.7):
+    """
+    H: shape (88, T)
+    """
+    pitches = np.arange(88)
+    weights = 2 ** (gamma * pitches / 12)
+    weights = weights / weights.mean()  # normalize
+
+    return H * weights[:, None]
+H_n = np.log(1+H_est)
+H_n = pitch_energy_compensation(H_n[1::2])
+print(H_n.shape)
+H_n = note_tracking(H_est)
+print(H_n.shape)
+print(H_n[:,100].shape)
+
+plt.figure()
+#plt.imshow(np.log(1+200*H_est[1::2]), aspect='auto', origin='lower')
+plt.imshow(H_n, aspect='auto', origin='lower')
 plt.colorbar()
 plt.title("Activation matrix H")
 plt.xlabel("Time frames")
