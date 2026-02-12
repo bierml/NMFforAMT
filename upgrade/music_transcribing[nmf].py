@@ -189,6 +189,7 @@ H_new = H_est[1::2].copy()
 
 print(len(res))
 
+from scipy.ndimage import label
 tempo, beats = librosa.beat.beat_track(y=x, sr=f_s)
 
 tempo = float(tempo)          # or: tempo = tempo.item()
@@ -200,7 +201,7 @@ beat_frames = list(map(int, beat_times * f_s / 1024))
 print("beat_frames=",beat_frames)
 print(f"Beat positions (sec.): {beat_times}")
 
-def note_tracking(H,th=1.5):
+def note_tracking(H,th=1.3):
   mean = np.mean(H)
   std = np.std(H)
   thresh = mean + th * std
@@ -230,22 +231,38 @@ def generate_transcription(H_v,onsets):
   for i in range(H_v.shape[1]):
     if(i in onsets):
       H_r[:,i] = H_v[:,i]
-      mask = H_r[:,i]
+      mask = H_v[:,i]
+    else:
+      H_r[:,i] = H_v[:,i] * mask
+  return H_r
+
+def enforce_min_duration(B, min_len=10):
+    for q in range(B.shape[0]):
+        labels, n = label(B[q])
+        for i in range(1, n+1):
+            if np.sum(labels == i) < min_len:
+                B[q][labels == i] = 0
+    return B
+
 H_v = np.log(1+100*H_new)
 #print(H_v.shape)
 H_v = note_tracking(H_v)
 H_v[0,:] = 0 #rough zero-ing A0 is the simplest way to approach NMF artefacts in low pitches
 #H_v = np.asarray(H_v)
 #H_v = beat_sync_H(H_v,beat_frames)
+H_v = enforce_min_duration(H_v)
+H_v = generate_transcription(H_v,res)
 import matplotlib.pyplot as plt
 plt.figure()
 #plt.imshow(H_v, aspect='auto', origin='lower')
-plt.imshow(H_est[0::2], aspect='auto', origin='lower')
+plt.imshow(H_v, aspect='auto', origin='lower')
 plt.colorbar()
 plt.title("Activation matrix H")
 plt.xlabel("Time frames")
 plt.ylabel("Pitch / Component index")
 plt.show()
+
+print(H_v)
 
 """# Попробуем готовый NMFD"""
 
