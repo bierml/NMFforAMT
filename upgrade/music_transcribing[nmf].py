@@ -553,6 +553,88 @@ print(top_k_indices(v, 9))
 
 """# Оценка результатов транскрибирования"""
 
+pip install pretty_midi
+
+import numpy as np
+import pretty_midi
+
+def midi_to_binary_matrix(
+    midi_input,
+    dt=0.02,                     # time quantum in seconds
+    pitch_range=(21, 108),  # A0–C8 by default
+    min_overlap=0.5         # fraction of frame that must be covered
+):
+    """
+    Convert MIDI to binary (88 x T) note activation matrix using fixed time grid.
+
+    A note is active in a frame if it overlaps the frame
+    by at least min_overlap * dt.
+    """
+
+    if dt <= 0:
+        raise ValueError("dt must be positive (seconds)")
+
+    # Load MIDI
+    if isinstance(midi_input, pretty_midi.PrettyMIDI):
+        pm = midi_input
+    else:
+        pm = pretty_midi.PrettyMIDI(midi_input)
+
+    # Time axis
+    total_time = pm.get_end_time()
+    T = int(np.ceil(total_time / dt))
+    frame_times = np.arange(T) * dt
+
+    n_pitches = pitch_range[1] - pitch_range[0] + 1
+    B = np.zeros((n_pitches, T), dtype=np.uint8)
+
+    # Process notes
+    for instrument in pm.instruments:
+        if instrument.is_drum:
+            continue
+
+        for note in instrument.notes:
+            if not (pitch_range[0] <= note.pitch <= pitch_range[1]):
+                continue
+
+            p = note.pitch - pitch_range[0]
+
+            start_frame = int(np.floor(note.start / dt))
+            end_frame   = int(np.ceil(note.end   / dt))
+
+            for t in range(start_frame, min(end_frame, T)):
+                frame_start = t * dt
+                frame_end   = frame_start + dt
+
+                overlap = max(
+                    0.0,
+                    min(note.end, frame_end) - max(note.start, frame_start)
+                )
+
+                if overlap >= min_overlap * dt:
+                    B[p, t] = 1
+
+    return B, frame_times
+
+# 20 ms frames (matches typical STFT hop ~512 @ 44.1kHz)
+dt = 0.02
+
+B, times = midi_to_binary_matrix(
+    "Prelude-in-E-Minor-Nr-4.mid",
+    dt=dt
+)
+
+print(B.shape)   # (88, T)
+import matplotlib.pyplot as plt
+plt.figure()
+#plt.imshow(H_v, aspect='auto', origin='lower')
+plt.imshow(B, aspect='auto', origin='lower')
+plt.colorbar()
+plt.title("Activation matrix H")
+plt.xlabel("Time frames")
+plt.ylabel("Pitch / Component index")
+plt.show()
+
 def evaluate_results(H_et,H):
   #H_et - reference transcription of the piece
   #H - estimated transcription of the piece
