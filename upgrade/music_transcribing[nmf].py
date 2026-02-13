@@ -25,11 +25,11 @@ import librosa
 import nimfa
 gamma = 100
 fft_bins = 2048
-f_s, x = wavfile.read("/content/FChopinPrelude28No4.wav")
+f_s, x = wavfile.read("/content/Prelude-in-E-Minor-Nr-4.wav")
 print(f_s)        # sample rate
 print(x.dtype)   # int16, int32, etc.
 print(x.shape)   # (N,) mono or (N, channels)
-print(x[100000])
+#print(x[100000])
 '''def init_nmf_template_pitch(K, pitch_set, freq_res, tol_pitch=0.05):
     """Initializes template matrix for a given set of pitches
 
@@ -103,15 +103,19 @@ elif(x.dtype==np.int16):
   x = x / (2**15)
 else:
   raise ValueError(f"Unsupported sample type: {x.dtype}")
+#print("We've got here!")
 spectrogram = np.abs(librosa.stft(x, n_fft=fft_bins,hop_length=1024))
+#spectrogram = np.zeros((((fft_bins//2+1),(x.shape[0]-2048)//1024+1)),dtype=np.complex128)
+#spectrogram = librosa.stft(x, n_fft=fft_bins,hop_length=1024,out=spectrogram)
+#print("We've got here1!")
 spectrogram_compressed = np.log(1+gamma*spectrogram)
-print(x[100000])
-print(np.min(spectrogram_compressed),np.max(spectrogram_compressed))
-print(spectrogram_compressed.shape)
+#print(x[100000])
+#print(np.min(spectrogram_compressed),np.max(spectrogram_compressed))
+#print(spectrogram_compressed.shape)
 pitches = [x+21 for x in range(88)]
 #pitches = [x for x in range(62,85)]
 freq_res = f_s/(2 * (fft_bins//2+1))
-print(freq_res)
+#print("freq res=",freq_res)
 def H(x):
   return (x+abs(x))/2
 def summf(v1,v2):
@@ -201,7 +205,7 @@ beat_frames = list(map(int, beat_times * f_s / 1024))
 print("beat_frames=",beat_frames)
 print(f"Beat positions (sec.): {beat_times}")
 
-def note_tracking(H,th=1.3):
+def note_tracking(H,th=1.5):
   mean = np.mean(H)
   std = np.std(H)
   thresh = mean + th * std
@@ -617,14 +621,14 @@ def midi_to_binary_matrix(
     return B, frame_times
 
 # 20 ms frames (matches typical STFT hop ~512 @ 44.1kHz)
-dt = 0.02
+dt = 1024 / f_s
 
 B, times = midi_to_binary_matrix(
     "Prelude-in-E-Minor-Nr-4.mid",
     dt=dt
 )
 
-print(B.shape)   # (88, T)
+print(H_v.shape, B.shape)   # (88, T)
 import matplotlib.pyplot as plt
 plt.figure()
 #plt.imshow(H_v, aspect='auto', origin='lower')
@@ -654,8 +658,12 @@ def evaluate_results(H_et,H):
   F1 = 2 * P * R / (P + R)
   return (P,R,F1)
 
+#print(evaluate_results(B,H_v))
+print(B.shape,H_v.shape)
 a = [0,1,1,1,0]
 b = [1,1,1,0,0]
 print(sum(1 for t, p in zip(a, b) if t == 1 and p == 1))
+
+evaluate_results(H_v[:,:B.shape[1]],B)
 
 print(TP)
