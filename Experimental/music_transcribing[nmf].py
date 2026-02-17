@@ -217,16 +217,16 @@ print(f"Beat positions (sec.): {beat_times}")
 def top_k_indices(v, k):
     v = np.asarray(v).ravel()      # ensure 1D ndarray
     return np.argpartition(v, -k)[-k:]
-def note_tracking(H_new,onsets):
+def note_tracking(H_new,onsets,pol=6):
   H_n = H_new.copy()
   H_r = np.zeros(H_new.shape)
   #for t in onsets:
   for t in onsets:
-    idx = top_k_indices(H_n[:,t],9)
+    idx = top_k_indices(H_n[:,t],pol)
     for i in idx:
       H_r[i,t] = 1
   return H_r
-def note_tracking_m(H,th=1.4):
+def note_tracking_m(H,th=1.25):
   mean = np.mean(H)
   std = np.std(H)
   thresh = mean + th * std
@@ -252,6 +252,7 @@ def beat_sync_H(H, beat_frames, mode="mean"):
 #CONTINUE HERE
 def generate_transcription(H_v,onsets):
   H_r = np.zeros(H_v.shape)
+  H_m = note_tracking_m(H_v)
   mask = np.zeros(88)
   for i in range(H_v.shape[1]):
     if(i in onsets):
@@ -260,7 +261,16 @@ def generate_transcription(H_v,onsets):
     else:
       H_r[:,i] = H_v[:,i] * mask
   return H_r
-
+def finalize_transcription(H_v,H_w,onsets):
+  H_r = np.zeros(H_v.shape)
+  mask = np.zeros(88)
+  for i in range(H_v.shape[1]):
+    if(i in onsets):
+      H_r[:,i] = H_v[:,i]
+      mask = H_v[:,i]
+    else:
+      H_r[:,i] = H_w[:,i] * mask
+  return H_r
 def enforce_min_duration(B, min_len=10):
     for q in range(B.shape[0]):
         labels, n = label(B[q])
@@ -274,9 +284,12 @@ def enforce_min_duration(B, min_len=10):
 H_v = np.log(1+100*H_new)
 H_w = H_v.copy()
 H_w = note_tracking_m(H_w)
+
 H_v = np.asarray(H_v)
 H_v = H_v / (H_v.max(axis=1, keepdims=True) + 1e-8)
 H_v = note_tracking(H_v,res)
+
+#print(H_f.shape)
 #H_v = np.asarray(H_v)
 #H_v = H_v / (H_v.max(axis=1, keepdims=True) + 1e-8)
 #print(H_v.shape)
@@ -284,9 +297,11 @@ H_v = note_tracking(H_v,res)
 #H_v = note_tracking_paper_style(H_v)
 H_v[0,:] = 0 #rough zero-ing A0 is the simplest way to approach NMF artefacts in low pitches
 H_w[0,:] = 0 #rough zero-ing A0 is the simplest way to approach NMF artefacts in low pitches
+H_f = finalize_transcription(H_v,H_w,res)
+H_f = enforce_min_duration(H_f)
 #H_v = np.asarray(H_v)
 #H_v = beat_sync_H(H_v,beat_frames)
-
+#print(res)
 
 #H_v = generate_transcription(H_v,res)
 #H_v = enforce_min_duration(H_v)
@@ -294,7 +309,7 @@ H_w[0,:] = 0 #rough zero-ing A0 is the simplest way to approach NMF artefacts in
 import matplotlib.pyplot as plt
 plt.figure()
 #plt.imshow(H_v, aspect='auto', origin='lower')
-plt.imshow(H_w, aspect='auto', origin='lower')
+plt.imshow(H_f, aspect='auto', origin='lower')
 plt.colorbar()
 plt.title("Activation matrix H")
 plt.xlabel("Time frames")
@@ -700,6 +715,6 @@ def top_k_indices(v, k):
     return np.argpartition(v, -k)[-k:]
 print(top_k_indices(b,3))
 
-evaluate_results(H_v[:,:B.shape[1]],B)
+evaluate_results(H_f[:,:B.shape[1]],B)
 
 print(TP)
