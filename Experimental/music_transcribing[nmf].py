@@ -271,7 +271,7 @@ def finalize_transcription(H_v,H_w,onsets):
     else:
       H_r[:,i] = H_w[:,i] * mask
   return H_r
-def enforce_min_duration(B, min_len=10):
+def enforce_min_duration(B, min_len=5):
     for q in range(B.shape[0]):
         labels, n = label(B[q])
         for i in range(1, n+1):
