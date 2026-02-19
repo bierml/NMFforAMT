@@ -214,6 +214,13 @@ beat_times = librosa.frames_to_time(beats, sr=f_s)
 beat_frames = list(map(int, beat_times * f_s / 1024))
 print("beat_frames=",beat_frames)
 print(f"Beat positions (sec.): {beat_times}")
+def norm_dynamic_range(H):
+  H_min = np.min(H)
+  H_max = np.max(H)
+  H_mean = np.mean(H)
+  Z = (H-H_mean)/(H_max-H_min)
+  Y = 1 / (1+np.exp(-Z))
+  return Y
 def top_k_indices(v, k):
     v = np.asarray(v).ravel()      # ensure 1D ndarray
     return np.argpartition(v, -k)[-k:]
@@ -235,7 +242,25 @@ def note_tracking_m(H,th=1.25):
     indicies = np.where(H[:,i] > thresh)
     H_copy[indicies,i] = 1
   return H_copy
-
+def track_notes(H):
+  H_copy = np.zeros(H.shape)
+  for i in range(H.shape[1]):
+    indicies = np.where(H[:,i] > 0.553)
+    H_copy[indicies,i] = 1
+  return H_copy
+def matrix_filter(H):
+  H_c = H.copy()
+  for i in range(H_c.shape[0]):
+    for j in range(H_c.shape[1]):
+      v = 0
+      if ((j-1)>=0):
+        v += H_c[i,j-1]
+      if((j+1)<H_c.shape[1]):
+        v += H_c[i,j+1]
+      v += H_c[i,j]
+      v = v / 3
+      H_c[i,j] = v
+  return H_c
 def beat_sync_H(H, beat_frames, mode="mean"):
     Q, T = H.shape
     B = len(beat_frames) - 1
@@ -299,6 +324,11 @@ H_v[0,:] = 0 #rough zero-ing A0 is the simplest way to approach NMF artefacts in
 H_w[0,:] = 0 #rough zero-ing A0 is the simplest way to approach NMF artefacts in low pitches
 H_f = finalize_transcription(H_v,H_w,res)
 H_f = enforce_min_duration(H_f)
+Y = norm_dynamic_range(H_new)
+Y = matrix_filter(Y)
+Y = track_notes(Y)
+Y = enforce_min_duration(Y)
+Y[0,:] = 0
 #H_v = np.asarray(H_v)
 #H_v = beat_sync_H(H_v,beat_frames)
 #print(res)
@@ -309,7 +339,7 @@ H_f = enforce_min_duration(H_f)
 import matplotlib.pyplot as plt
 plt.figure()
 #plt.imshow(H_v, aspect='auto', origin='lower')
-plt.imshow(H_f, aspect='auto', origin='lower')
+plt.imshow(Y, aspect='auto', origin='lower')
 plt.colorbar()
 plt.title("Activation matrix H")
 plt.xlabel("Time frames")
@@ -716,5 +746,9 @@ def top_k_indices(v, k):
 print(top_k_indices(b,3))
 
 evaluate_results(H_f[:,:B.shape[1]],B)
+
+"""Оценка результатов подхода из статьи: https://www.researchgate.net/publication/320426354_Knowledge_based_Fundamental_and_Harmonic_Frequency_Detection_in_Polyphonic_Music_Analysis"""
+
+evaluate_results(Y[:,:B.shape[1]],B)
 
 print(TP)
