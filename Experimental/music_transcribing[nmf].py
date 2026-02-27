@@ -25,6 +25,11 @@ import librosa
 import nimfa
 gamma = 100
 fft_bins = 2048
+onsets_mode = True
+if(onsets_mode):
+  pitch_count = 88 * 2
+else:
+  pitch_count = 88
 f_s, x = wavfile.read("/content/Prelude-in-E-Minor-Nr-4.wav")
 print(f_s)        # sample rate
 print(x.dtype)   # int16, int32, etc.
@@ -69,6 +74,14 @@ def init_nmf_template_pitch_onset(K, pitch_set, freq_res, tol_pitch=0.05):
         W[:, 2*r] = 0.1
         W[:, 2*r+1] = template_pitch(K, pitch_set[r], freq_res, tol_pitch=tol_pitch)
     return W
+def sparse_H(H,onsets):
+  H_r = H.copy()
+  for i in range(H_r.shape[1]):
+    if(i in onsets or (i-1) in onsets or (i-2) in onsets):
+      H[1::2,i] = 0
+    else:
+      H[0::2,i] = 0
+  return H_r
 def template_pitch(K, pitch, freq_res, tol_pitch=0.05):
     """Defines spectral template for a given pitch
 
@@ -101,20 +114,27 @@ elif(x.dtype==np.int16):
 else:
   raise ValueError(f"Unsupported sample type: {x.dtype}")
 onsets = librosa.onset.onset_detect(y=x, sr=f_s, hop_length=1024,units='frames')
+
 print(onsets)
 spectrogram = np.abs(librosa.stft(x, n_fft=fft_bins,hop_length=1024))
 spectrogram_compressed = np.log(1+gamma*spectrogram)
 pitches = [x+21 for x in range(88)]
 freq_res = f_s/(2 * (fft_bins//2+1))
 
-import matplotlib.pyplot as plt
-W_temp = init_nmf_template_pitch(fft_bins//2+1,pitches,freq_res)
-H_temp = np.random.rand(88, spectrogram_compressed.shape[1])
-#H_temp = sparse_H(H_temp,res)
+if(onsets_mode):
+  W_temp = init_nmf_template_pitch_onset(fft_bins//2+1,pitches,freq_res)
+else:
+  W_temp = init_nmf_template_pitch(fft_bins//2+1,pitches,freq_res)
+#W_temp = np.random.rand(spectrogram_compressed.shape[0],88)
+H_temp = np.random.rand(pitch_count, spectrogram_compressed.shape[1])
+if(onsets_mode):
+  H_temp = sparse_H(H_temp,onsets)
 #nmf = nimfa.Nmf(spectrogram_compressed, seed='fixed', W=W_temp)
+print(W_temp.shape)
+print(H_temp.shape)
 nmf = nimfa.Nmf(
     spectrogram_compressed,
-    rank=88,
+    rank=pitch_count,
     seed='fixed',
     W=W_temp,
     H=H_temp,
@@ -125,8 +145,20 @@ nmf_fit = nmf()
 W_est = nmf_fit.basis()
 H_est = nmf_fit.coef()
 
-#H_new = H_est[1::2].copy()
-H_new = H_est
+if(onsets_mode):
+  H_new = H_est[1::2]
+else:
+  H_new = H_est.copy()
+
+import matplotlib.pyplot as plt
+plt.figure()
+#plt.imshow(H_v, aspect='auto', origin='lower')
+plt.imshow(H_new, aspect='auto', origin='lower')
+plt.colorbar()
+plt.title("Activation matrix H")
+plt.xlabel("Time frames")
+plt.ylabel("Pitch / Component index")
+plt.show()
 
 print(len(res))
 print(type(x))
@@ -280,7 +312,8 @@ Y = matrix_filter(Y)
 import matplotlib.pyplot as plt
 plt.figure()
 #plt.imshow(H_v, aspect='auto', origin='lower')
-plt.imshow(Y[:,140:160], aspect='auto', origin='lower')
+#plt.imshow(Y[:,140:160], aspect='auto', origin='lower')
+plt.imshow(Y, aspect='auto', origin='lower')
 plt.colorbar()
 plt.title("Activation matrix H")
 plt.xlabel("Time frames")
@@ -300,26 +333,45 @@ def transcribe_frame(fr,pol=9):
   notes = sorted(notes, key=lambda x: x[1],reverse=True)
   return notes
   print(notes)
-print(transcribe_frame(Y[:,140]))
+print(transcribe_frame(Y[:,157]))
 print(Y[38,203],Y[39,203])
 
+def pitch_harmonics(p):
+  r = [p+12,p+19,p+24,p+28,p+31,p+34,p+36]
+  return r
+def pitch_energy(fp,p):
+  en = 0
+  en_t = np.sum(np.square(fp))
+  h = pitch_harmonics(p)
+  h = [m for m in h if m <= 87]
+  #print(h)
+  for l in h:
+    en += fp[l]**2
+  #print(en)
+  return float(en/en_t)
+  #return en[0,0]
 def transcribe_frame(fr,pol=9):
-  peaks = [int(p) for p in top_k_indices(fr,10)]
+  #peaks = [int(p) for p in top_k_indices(fr,10)]
+  peaks = [int(p) for p in range(88) if fr[p]>(1/3) * np.max(fr)]
   notes = []
   alpha = -1
-  thr = np.median(fr,axis=0)
+  thr = 0.33 * np.max(fr,axis=0)
   for p in peaks:
-    a = [p+12,p+19,p+24,p+28,p+31,p+34,p+36]
+    a = pitch_harmonics(p)
     sc = 0
     for pt in range(len(a)):
       if a[pt] in peaks:
         sc += (pt+2)**alpha
-    if(p > thr):
-      notes.append((p,float(fr[p,0]),sc))
+    if(fr[p] > thr):
+      #notes.append((p,float(fr[p,0]),sc))
+      notes.append((p,pitch_energy(fr[:,0],p),sc))
   notes = sorted(notes, key=lambda x: x[2],reverse=True)
   return notes
   print(notes)
-print(transcribe_frame(Y[:,152]))
+print(transcribe_frame(Y[:,155]))
+print(pitch_energy(Y[:,152],50))
+print(np.sum(np.square(Y[:, 152])))
+#print(Y[:,152].shape)
 print(Y[38,203],Y[39,203])
 
 print(H_v)
