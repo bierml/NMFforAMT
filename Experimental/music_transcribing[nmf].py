@@ -188,6 +188,7 @@ beat_times = librosa.frames_to_time(beats, sr=f_s)
 beat_frames = list(map(int, beat_times * f_s / 1024))
 print("beat_frames=",beat_frames)
 print(f"Beat positions (sec.): {beat_times}")
+
 def norm_dynamic_range(H):
   H_min = np.min(H)
   H_max = np.max(H)
@@ -195,9 +196,6 @@ def norm_dynamic_range(H):
   Z = (H-H_mean)/(H_max-H_min)
   Y = 1 / (1+np.exp(-Z))
   return Y
-def top_k_indices(v, k):
-    v = np.asarray(v).ravel()      # ensure 1D ndarray
-    return np.argpartition(v, -k)[-k:]
 def transcribe_frame(fr,thr=0.1,pol=9):
   peaks = top_k_indices(fr,20)
   notes = []
@@ -358,14 +356,23 @@ def pitch_energy(fp,p):
   notes = sorted(notes, key=lambda x: x[1],reverse=True)
   return notes
   print(notes)'''
+'''def top_k_indices(v, k):
+    v = np.asarray(v).ravel()      # ensure 1D ndarray
+    return np.argpartition(v, -k)[-k:]'''
+
+def top_k_indices(v, k):
+    v = np.asarray(v).ravel()          # ensure 1D
+    idx = np.argpartition(v, -k)[-k:]  # indices of k largest elements
+    idx = idx[np.argsort(v[idx])[::-1]]  # sort them by value (descending)
+    return idx
 def pitch_harmonics(p):
   r = [p+12,p+19,p+24,p+28,p+31,p+34,p+36]
   return [m for m in r if m <= 87]
-def transcribe_frame(fr,pol=9):
+def transcribe_frame(fr,thr=0.7):
   frn = fr.copy()
   peaks = [int(p) for p in top_k_indices(fr,20)]
   peaks = sorted(peaks)
-  print(peaks)
+  #print(peaks)
   alpha = 0.5
   rv_start = 0.7
   notes = []
@@ -379,13 +386,24 @@ def transcribe_frame(fr,pol=9):
         '''* float(frn[pch[idx]])**2'''
         frn[pch[idx]] -= rv_start*(alpha)**idx
     #score correction
-    if(peaks[p]<=30):
-      sc *= 2**((peaks[p] - 69) / 12)
-    notes.append((peaks[p],sc))
+    '''if(peaks[p]<=87):
+      sc *= 2**((peaks[p] - 69) / 12)'''
+    #sc *= float(frn[peaks[p]]/(np.max(frn)))
+    #notes.append((peaks[p],sc))
+    notes.append((peaks[p],float(sc*fr[peaks[p]])))
   notes = sorted(notes, key=lambda x: x[1],reverse=True)
-  return notes
+  notes = list(filter(lambda t: t[1] > thr, notes))
+  return [t[0] for t in notes]
   #print(notes)
 
+def transcribe_onset(m):
+  st = np.zeros((88,))
+  for j in range(m.shape[1]):
+    for l in transcribe_frame(m[:,j]):
+      st[l] +=1
+  ap = [int(p) for p in top_k_indices(st,20)]
+  print(st[ap[0]],st[ap[1]])
+  return ap
 def pitch_energy(fp,p):
   en = 0
   en_t = np.sum(np.square(fp))
@@ -397,7 +415,8 @@ def pitch_energy(fp,p):
   #print(en)
   return float(en/en_t)
   #return en[0,0]
-print(transcribe_frame(H_m[:,8]))
+print(transcribe_frame(H_m[:,1]))
+print(transcribe_onset(Y[:,140:152]))
 #print(transcribe_frame(Y[:,152]))
 #print(Y[38,203],Y[39,203])
 
