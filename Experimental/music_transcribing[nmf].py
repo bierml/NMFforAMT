@@ -35,7 +35,7 @@ print(f_s)        # sample rate
 print(x.dtype)   # int16, int32, etc.
 print(x.shape)   # (N,) mono or (N, channels)
 #print(x[100000])
-def init_nmf_template_pitch(K, pitch_set, freq_res, tol_pitch=0.01):
+def init_nmf_template_pitch(K, pitch_set, freq_res, tol_pitch=0.05):
     """Initializes template matrix for a given set of pitches
 
     Notebook: C8/C8S3_NMFSpecFac.ipynb
@@ -54,7 +54,7 @@ def init_nmf_template_pitch(K, pitch_set, freq_res, tol_pitch=0.01):
     for r in range(R):
         W[:, r] = template_pitch(K, pitch_set[r], freq_res, tol_pitch=tol_pitch)
     return W
-def init_nmf_template_pitch_onset(K, pitch_set, freq_res, tol_pitch=0.01):
+def init_nmf_template_pitch_onset(K, pitch_set, freq_res, tol_pitch=0.05):
     """Initializes template matrix with onsets for a given set of pitches
 
     Notebook: C8/C8S3_NMFSpecFac.ipynb
@@ -217,6 +217,7 @@ def matrix_filter(H):
       v = v / 3
       H_c[i,j] = v
   return H_c
+
 def enforce_min_duration(B, min_len=10):
     for q in range(B.shape[0]):
         labels, n = label(B[q])
@@ -368,28 +369,37 @@ def top_k_indices(v, k):
 def pitch_harmonics(p):
   r = [p+12,p+19,p+24,p+28,p+31,p+34,p+36]
   return [m for m in r if m <= 87]
-def transcribe_frame(fr,thr=0.7):
+def transcribe_frame(fr,thr=0.5):
   frn = fr.copy()
   peaks = [int(p) for p in top_k_indices(fr,20)]
+  #peaks = [int(p) for p in range(88) if fr[p] > 0.25]
   peaks = sorted(peaks)
   #print(peaks)
   alpha = 0.5
   rv_start = 0.7
   notes = []
   for p in range(len(peaks)):
+    frns = frn.copy()
     sc = 0
     en = fr[peaks[p]]
     pch = pitch_harmonics(peaks[p])
+    ind = []
     for idx in range(len(pch)):
       if(frn[pch[idx]]>rv_start*(alpha)**idx):
         sc += 1/(idx+1)
         '''* float(frn[pch[idx]])**2'''
         frn[pch[idx]] -= rv_start*(alpha)**idx
+        ind.append(idx)
     #score correction
     '''if(peaks[p]<=87):
       sc *= 2**((peaks[p] - 69) / 12)'''
     #sc *= float(frn[peaks[p]]/(np.max(frn)))
     #notes.append((peaks[p],sc))
+    '''if(float(sc*fr[peaks[p]])<=thr):
+      for i in ind:
+        frn[pch[i]] += rv_start*(alpha)**i'''
+    if(float(sc*fr[peaks[p]])<=thr):
+      frn = frns
     notes.append((peaks[p],float(sc*fr[peaks[p]])))
   notes = sorted(notes, key=lambda x: x[1],reverse=True)
   notes = list(filter(lambda t: t[1] > thr, notes))
@@ -398,12 +408,21 @@ def transcribe_frame(fr,thr=0.7):
 
 def transcribe_onset(m):
   st = np.zeros((88,))
+  ln = m.shape[1] // 2
+  r = []
+  #print("ln",ln)
   for j in range(m.shape[1]):
     for l in transcribe_frame(m[:,j]):
       st[l] +=1
   ap = [int(p) for p in top_k_indices(st,20)]
-  print(st[ap[0]],st[ap[1]])
-  return ap
+  for el in ap:
+    #print(el,st[el])
+    if(st[el]>ln):
+      r.append(el)
+  #print(st[ap[0]],st[ap[1]])
+  #return ap
+  #print(st[ap[0]],st[ap[1]])
+  return r
 def pitch_energy(fp,p):
   en = 0
   en_t = np.sum(np.square(fp))
@@ -415,10 +434,23 @@ def pitch_energy(fp,p):
   #print(en)
   return float(en/en_t)
   #return en[0,0]
-print(transcribe_frame(H_m[:,1]))
-print(transcribe_onset(Y[:,140:152]))
+#print(transcribe_frame(H_m[:,1]))
+print(transcribe_onset(Y[:,152:162]))
 #print(transcribe_frame(Y[:,152]))
 #print(Y[38,203],Y[39,203])
+
+
+import matplotlib.pyplot as plt
+plt.figure()
+#plt.imshow(H_v, aspect='auto', origin='lower')
+#plt.imshow(Y[:,140:160], aspect='auto', origin='lower')
+plt.imshow(Y[:,140:150], aspect='auto', origin='lower')
+#plt.imshow(Y, aspect='auto', origin='lower')
+plt.colorbar()
+plt.title("Activation matrix H")
+plt.xlabel("Time frames")
+plt.ylabel("Pitch / Component index")
+plt.show()
 
 def pitch_energy(fp,p):
   en = 0
