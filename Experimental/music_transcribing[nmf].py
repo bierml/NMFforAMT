@@ -369,7 +369,7 @@ def top_k_indices(v, k):
 def pitch_harmonics(p):
   r = [p+12,p+19,p+24,p+28,p+31,p+34,p+36]
   return [m for m in r if m <= 87]
-def transcribe_frame(fr,thr=0.5):
+def transcribe_frame(fr,thr=0.25):
   frn = fr.copy()
   peaks = [int(p) for p in top_k_indices(fr,20)]
   #peaks = [int(p) for p in range(88) if fr[p] > 0.25]
@@ -422,7 +422,20 @@ def transcribe_onset(m):
   #print(st[ap[0]],st[ap[1]])
   #return ap
   #print(st[ap[0]],st[ap[1]])
+  #print(st)
   return r
+def transcribe_H(Y,os):
+  tr = np.zeros(Y.shape)
+  for idx in range(len(os)-1):
+    nts = transcribe_onset(Y[:,os[idx]:os[idx]+10])
+    for n in nts:
+      tr[n,os[idx]:os[idx]+10] = 1
+    for i in range(os[idx]+10,os[idx+1]):
+      for n in nts:
+        if(np.max(tr[n,i-4:i+4])>0.5):
+          tr[n,i] = 1
+  return tr
+
 def pitch_energy(fp,p):
   en = 0
   en_t = np.sum(np.square(fp))
@@ -435,16 +448,17 @@ def pitch_energy(fp,p):
   return float(en/en_t)
   #return en[0,0]
 #print(transcribe_frame(H_m[:,1]))
-print(transcribe_onset(Y[:,152:162]))
+print(transcribe_onset(Y[:,479:489]))
 #print(transcribe_frame(Y[:,152]))
 #print(Y[38,203],Y[39,203])
 
-
+trscrptn = transcribe_H(Y,onsets)
 import matplotlib.pyplot as plt
 plt.figure()
 #plt.imshow(H_v, aspect='auto', origin='lower')
 #plt.imshow(Y[:,140:160], aspect='auto', origin='lower')
-plt.imshow(Y[:,140:150], aspect='auto', origin='lower')
+#plt.imshow(Y[:,479:489], aspect='auto', origin='lower')
+plt.imshow(trscrptn, aspect='auto', origin='lower')
 #plt.imshow(Y, aspect='auto', origin='lower')
 plt.colorbar()
 plt.title("Activation matrix H")
@@ -921,6 +935,10 @@ def top_k_indices(v, k):
     v = np.asarray(v).ravel()      # ensure 1D ndarray
     return np.argpartition(v, -k)[-k:]
 print(top_k_indices(b,3))
+
+print(evaluate_results(trscrptn[:,:B.shape[1]],B))
+#print(trscrptn[:,B.shape[1]].shape)
+#print(B.shape)
 
 evaluate_results(H_f[:,:B.shape[1]],B)
 
