@@ -432,7 +432,7 @@ def transcribe_H(Y,os):
       tr[n,os[idx]:os[idx]+10] = 1
     for i in range(os[idx]+10,os[idx+1]):
       for n in nts:
-        if(np.max(tr[n,i-4:i+4])>0.5):
+        if(np.max(Y[n,i-4:i+4])>0.5):
           tr[n,i] = 1
   return tr
 
