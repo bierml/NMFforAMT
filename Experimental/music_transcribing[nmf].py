@@ -408,17 +408,25 @@ def transcribe_frame(fr,thr=0.25):
 
 def transcribe_onset(m):
   st = np.zeros((88,))
-  ln = m.shape[1] // 2
+  #ln = m.shape[1] // 2
   r = []
   #print("ln",ln)
   for j in range(m.shape[1]):
     for l in transcribe_frame(m[:,j]):
       st[l] +=1
-  ap = [int(p) for p in top_k_indices(st,20)]
+  ap = [int(p) for p in top_k_indices(st,88)]
+  s = 0
+  summa = np.sum(st)
   for el in ap:
+    s += st[el]
+    if(s>=round((0.7 * summa)) or st[el]==0):
+      break
+    r.append(el)
     #print(el,st[el])
-    if(st[el]>ln):
-      r.append(el)
+    #if(st[el]>ln):
+    #  r.append(el)
+  #print(np.sum(st))
+
   #print(st[ap[0]],st[ap[1]])
   #return ap
   #print(st[ap[0]],st[ap[1]])
@@ -434,6 +442,18 @@ def transcribe_H(Y,os):
       for n in nts:
         if(np.max(Y[n,i-4:i+4])>0.5):
           tr[n,i] = 1
+        #else:
+        #  nts.remove(n)
+      #if(len(nts)==0):
+        #break
+  '''nts = transcribe_onset(Y[:,os[len(os)-1]:os[len(os)-1]+10])
+  for n in nts:
+    tr[n,os[len(os)-1]:os[len(os)-1]+10] = 1
+  print(Y.shape[1])
+  for i in range(os[len(os)-1]+10,Y.shape[1]-5):
+    for n in nts:
+      if(np.max(Y[n,i-4:i+5])>0.5):
+        tr[n,i] = 1'''
   return tr
 
 def pitch_energy(fp,p):
@@ -453,6 +473,8 @@ print(transcribe_onset(Y[:,479:489]))
 #print(Y[38,203],Y[39,203])
 
 trscrptn = transcribe_H(Y,onsets)
+trscrptn[0,:] = 0
+trscrptn = enforce_min_duration(trscrptn,min_len=10)
 import matplotlib.pyplot as plt
 plt.figure()
 #plt.imshow(H_v, aspect='auto', origin='lower')
@@ -465,6 +487,19 @@ plt.title("Activation matrix H")
 plt.xlabel("Time frames")
 plt.ylabel("Pitch / Component index")
 plt.show()
+
+m = trscrptn[:,138:150]
+print(np.min(m), np.max(m))
+print(np.unique(m))
+print(trscrptn.shape)
+import matplotlib.pyplot as plt
+plt.imshow(m, aspect='auto', origin='lower')
+plt.colorbar()
+plt.title("Activation matrix H")
+plt.xlabel("Time frames")
+plt.ylabel("Pitch / Component index")
+plt.show()
+print(m[:,2])
 
 def pitch_energy(fp,p):
   en = 0
@@ -893,12 +928,13 @@ def midi_to_binary_matrix(
 
 # 20 ms frames (matches typical STFT hop ~512 @ 44.1kHz)
 dt = 1024 / f_s
-print(dt)
+#print(dt)
+#dt = 0.023
 B, times = midi_to_binary_matrix(
     "Prelude-in-E-Minor-Nr-4.mid",
     dt=dt
 )
-
+print(B.shape,trscrptn.shape)
 #print(H_v.shape, B.shape)   # (88, T)
 import matplotlib.pyplot as plt
 plt.figure()
@@ -937,6 +973,7 @@ def top_k_indices(v, k):
 print(top_k_indices(b,3))
 
 print(evaluate_results(trscrptn[:,:B.shape[1]],B))
+#print(evaluate_results(trscrptn,B[:,:trscrptn.shape[1]]))
 #print(trscrptn[:,B.shape[1]].shape)
 #print(B.shape)
 
@@ -947,3 +984,15 @@ evaluate_results(H_f[:,:B.shape[1]],B)
 evaluate_results(Y[:,:B.shape[1]],B)
 
 print(TP)
+
+import matplotlib.pyplot as plt
+plt.figure()
+#plt.imshow(H_v, aspect='auto', origin='lower')
+plt.imshow(B[:,138:150], aspect='auto', origin='lower')
+plt.colorbar()
+plt.title("Activation matrix H")
+plt.xlabel("Time frames")
+plt.ylabel("Pitch / Component index")
+plt.show()
+
+print(B[:,139])
