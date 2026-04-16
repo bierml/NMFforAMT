@@ -17,6 +17,47 @@ pip install nimfa
 !grep -rl "asmatrixrix" /usr/local/lib/python3.12/dist-packages/nimfa | xargs sed -i 's/asmatrixrix/asmatrix/g'
 !grep -R "asmatrixrix" /usr/local/lib/python3.12/dist-packages/nimfa
 
+"""Попробуем CQT вместо STFT, мб результаты будут лучше"""
+
+from scipy.io import wavfile
+import numpy as np
+import librosa
+import nimfa
+g = 2
+HOP = 1024
+K = 3
+f_s, x = wavfile.read("/content/Prelude-in-E-Minor-Nr-4.wav")
+
+def norm_log(H, gamma=5):
+    return np.log1p(gamma * H)
+def harmonic_template(coef=3):
+  #this should contain harmonic template with nearest frequencies of harmonics for coef*88-length vector
+if(x.dtype==np.int32):
+  x = x / (2**31)
+elif(x.dtype==np.int16):
+  x = x / (2**15)
+else:
+  raise ValueError(f"Unsupported sample type: {x.dtype}")
+onsets = librosa.onset.onset_detect(y=x, sr=f_s, hop_length=HOP,units='frames')
+spectrogram = np.abs(librosa.cqt(x, fmin=librosa.note_to_hz('A0'), bins_per_octave=12 * K, n_bins=88 * K, hop_length=HOP))
+spectrogram_norm = norm_log(spectrogram, g)
+spectrogram_norm = librosa.util.normalize(spectrogram_norm, norm = 2, axis = 0, threshold = 0.05)
+print(np.max(spectrogram_norm))
+#spectrogram_compressed = np.log(1+gamma*spectrogram)
+
+
+import matplotlib.pyplot as plt
+plt.figure()
+#plt.imshow(H_v, aspect='auto', origin='lower')
+#plt.imshow(Y[:,140:160], aspect='auto', origin='lower')
+plt.imshow(spectrogram_norm, aspect='auto', origin='lower')
+#plt.imshow(Y, aspect='auto', origin='lower')
+plt.colorbar()
+plt.title("Activation matrix H")
+plt.xlabel("Time frames")
+plt.ylabel("Pitch / Component index")
+plt.show()
+
 """**Читаем исходный файл**"""
 
 from scipy.io import wavfile
@@ -117,6 +158,8 @@ onsets = librosa.onset.onset_detect(y=x, sr=f_s, hop_length=fft_bins//2,units='f
 
 print(onsets)
 spectrogram = np.abs(librosa.stft(x, n_fft=fft_bins,hop_length=fft_bins//2))
+for i in range(spectrogram.shape[0]):
+  spectrogram[i,:] *= (f_s / 2 * fft_bins)
 spectrogram_compressed = np.log(1+gamma*spectrogram)
 pitches = [x+21 for x in range(88)]
 freq_res = f_s/(2 * (fft_bins//2+1))
@@ -139,7 +182,8 @@ nmf = nimfa.Nmf(
     W=W_temp,
     H=H_temp,
     max_iter=200,
-    beta=1, sparsity=(None, 0.2)
+    beta=1, sparsity=(None, 0.2),
+    objective='div'
 )
 nmf_fit = nmf()
 W_est = nmf_fit.basis()
@@ -149,6 +193,8 @@ if(onsets_mode):
   H_new = H_est[1::2]
 else:
   H_new = H_est.copy()
+
+
 
 import matplotlib.pyplot as plt
 plt.figure()
@@ -377,6 +423,7 @@ def transcribe_frame(fr,thr=0.25):
   #print(peaks)
   alpha = 0.5
   rv_start = 0.7
+  #rv_start = 1
   notes = []
   for p in range(len(peaks)):
     frns = frn.copy()
