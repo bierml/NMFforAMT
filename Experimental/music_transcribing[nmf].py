@@ -11,6 +11,9 @@ Original file is located at
 Из всех библиотек с реализацией NMF пока остановился на Nimfa, не пойдет с ней - буду пробовать работать с NMFToolbox. Перед тем как запускать код дальше надо установить Nimfa.
 """
 
+import numpy as np
+np.Inf = np.inf
+
 pip install nimfa
 
 !grep -rl "np.mat" /usr/local/lib/python3.12/dist-packages/nimfa | xargs sed -i 's/np.mat/np.asmatrix/g'
@@ -18,6 +21,27 @@ pip install nimfa
 !grep -R "asmatrixrix" /usr/local/lib/python3.12/dist-packages/nimfa
 
 """Попробуем CQT вместо STFT, мб результаты будут лучше"""
+
+import numpy as np
+K = 3
+def frec(p,K):
+  return 440 * 2**((p*K-49*K)/(12*K))
+def harmonic_template(p, coef=3, t=0.1):
+  vec = np.zeros((88 * coef))
+  fq = frec(p,1)
+  fu = 440 * 2 ** (39/12)
+  tpls = []
+  m = int(np.floor(fu / fq))
+  for fr in range(m):
+    i_s = int(np.ceil(np.log2(((fq * (fr+1) * (1-t/2)) / 440)) * (12 * coef) + 49 * coef))
+    i_f = int(np.floor(np.log2(((fq * (fr+1) * (1+t/2)) / 440)) * (12 * coef) + 49 * coef))
+    for k in range(i_s-1,i_f):
+      vec[k] = 1
+  return vec
+
+harmonic_template(49)
+
+print(frec(69,1))
 
 from scipy.io import wavfile
 import numpy as np
@@ -30,8 +54,39 @@ f_s, x = wavfile.read("/content/Prelude-in-E-Minor-Nr-4.wav")
 
 def norm_log(H, gamma=5):
     return np.log1p(gamma * H)
-def harmonic_template(coef=3):
-  #this should contain harmonic template with nearest frequencies of harmonics for coef*88-length vector
+def frec(p,K):
+  return 440 * 2**((p*K-49*K)/(12*K))
+def harmonic_template(p, coef=3, t=0.1):
+  vec = np.zeros((88 * coef))
+  fq = frec(p,1)
+  fu = 440 * 2 ** (39/12)
+  tpls = []
+  m = int(np.floor(fu / fq))
+  for fr in range(m):
+    i_s = int(np.ceil(np.log2(((fq * (fr+1) * (1-t/2)) / 440)) * (12 * coef) + 49 * coef))
+    i_f = int(np.floor(np.log2(((fq * (fr+1) * (1+t/2)) / 440)) * (12 * coef) + 49 * coef))
+    for k in range(i_s-1,i_f):
+      vec[k] = 1
+  return vec
+def init_W(coef=3, t=0.1):
+  vec = np.zeros((88 * coef, 88))
+  for i in range(88):
+    vec[:,i] = harmonic_template(i+1,coef,t)
+  return vec
+
+def sparsity(x, eps=1e-10):
+    x = np.asarray(x).ravel()
+    N = x.size
+
+    if N <= 1:
+        return 0.0  # not defined, fallback
+
+    l2_norm = np.sqrt(np.sum(x**2)) + eps
+
+    term = np.sum(np.tanh(np.abs(x)**2)) / l2_norm
+
+    return (np.sqrt(N) - term) / (np.sqrt(N) - 1)
+
 if(x.dtype==np.int32):
   x = x / (2**31)
 elif(x.dtype==np.int16):
@@ -42,10 +97,13 @@ onsets = librosa.onset.onset_detect(y=x, sr=f_s, hop_length=HOP,units='frames')
 spectrogram = np.abs(librosa.cqt(x, fmin=librosa.note_to_hz('A0'), bins_per_octave=12 * K, n_bins=88 * K, hop_length=HOP))
 spectrogram_norm = norm_log(spectrogram, g)
 spectrogram_norm = librosa.util.normalize(spectrogram_norm, norm = 2, axis = 0, threshold = 0.05)
-print(np.max(spectrogram_norm))
+
+max_index = np.argmax(spectrogram_norm[:,onsets[0]+5])
+print(max_index)  # 1
+print(sparsity(spectrogram_norm[:,onsets[10]+5]))
 #spectrogram_compressed = np.log(1+gamma*spectrogram)
 
-
+W_i = init_W(3,0.01)
 import matplotlib.pyplot as plt
 plt.figure()
 #plt.imshow(H_v, aspect='auto', origin='lower')
@@ -53,10 +111,155 @@ plt.figure()
 plt.imshow(spectrogram_norm, aspect='auto', origin='lower')
 #plt.imshow(Y, aspect='auto', origin='lower')
 plt.colorbar()
-plt.title("Activation matrix H")
+plt.title("Activation matrix W")
 plt.xlabel("Time frames")
 plt.ylabel("Pitch / Component index")
 plt.show()
+
+print(onsets)
+
+import numpy as np
+
+def project_to_l1_l2_nonneg(h, l1_target, l2_target, max_iter=100):
+    """
+    Project vector h onto the set:
+        {x >= 0, ||x||_1 = l1_target, ||x||_2 = l2_target}
+    Based on iterative adjustment described in SNMF paper.
+    """
+    n = len(h)
+
+    # Step (b): shift to match l1 norm
+    s = h + (l1_target - np.sum(h)) / n
+
+    for _ in range(max_iter):
+        # Enforce non-negativity temporarily
+        s[s < 0] = 0
+
+        # If all zeros, break
+        if np.all(s == 0):
+            break
+
+        m = np.ones(n) * (l1_target / n)
+
+        diff = s - m
+        diff_norm_sq = np.sum(diff**2)
+
+        if diff_norm_sq == 0:
+            break
+
+        # Compute alpha (step c)
+        numerator = -np.dot(diff, m)
+        radicand = (np.dot(diff, m))**2 - diff_norm_sq * (np.sum(m**2) - l2_target**2)
+
+        # Numerical safety
+        radicand = max(radicand, 0)
+
+        alpha = (numerator + np.sqrt(radicand)) / diff_norm_sq
+
+        s = m + alpha * (s - m)
+
+        # Check convergence
+        if np.all(s >= 0) and np.isclose(np.linalg.norm(s, 1), l1_target, atol=1e-6) \
+           and np.isclose(np.linalg.norm(s, 2), l2_target, atol=1e-6):
+            break
+
+    return np.maximum(s, 0)
+
+
+def snmf(V, rank, l1_target, l2_target, num_iters=100, mu=1e-3, seed=None):
+    """
+    Sparse Non-Negative Matrix Factorization (SNMF)
+
+    Args:
+        V : (m x n) non-negative matrix
+        rank : number of components
+        l1_target : desired L1 norm of columns of H
+        l2_target : desired L2 norm of columns of H
+        num_iters : iterations
+        mu : step size
+        seed : random seed
+
+    Returns:
+        W : (m x rank)
+        H : (rank x n)
+    """
+    np.random.seed(seed)
+
+    m, n = V.shape
+
+    # Initialize W, H positive
+    W = np.abs(np.random.randn(m, rank))
+    H = np.abs(np.random.randn(rank, n))
+
+    for it in range(num_iters):
+
+        # ---- Update H ----
+        grad_H = W.T @ (W @ H - V)
+        H = H - mu * grad_H
+
+        # Project each column of H
+        for j in range(n):
+            H[:, j] = project_to_l1_l2_nonneg(H[:, j], l1_target, l2_target)
+
+        # ---- Update W (standard NMF multiplicative update) ----
+        WH = W @ H
+        W *= (V @ H.T) / (WH @ H.T + 1e-10)
+
+        # Normalize W columns (optional but stabilizes)
+        norms = np.linalg.norm(W, axis=0) + 1e-10
+        W /= norms
+        H *= norms[:, np.newaxis]
+
+    return W, H
+
+'''W, H = snmf(
+    V,
+    rank=10,
+    l1_target=5.0,
+    l2_target=2.0,
+    num_iters=200,
+    mu=1e-3,
+    seed=42
+)'''
+#V = np.abs(np.random.randn(50, 30))
+W, H = snmf(
+    spectrogram_norm[:,87:287],
+    rank=10,
+    l1_target=10.0,   # less restrictive
+    l2_target=5.0,
+    num_iters=100,
+    mu=1e-2
+)
+
+print("Reconstruction error:", np.linalg.norm(spectrogram_norm[:,87:287] - W @ H))
+
+import matplotlib.pyplot as plt
+plt.figure()
+#plt.imshow(H_v, aspect='auto', origin='lower')
+#plt.imshow(Y[:,140:160], aspect='auto', origin='lower')
+plt.imshow(W, aspect='auto', origin='lower')
+#plt.imshow(Y, aspect='auto', origin='lower')
+plt.colorbar()
+plt.title("Activation matrix W")
+plt.xlabel("Time frames")
+plt.ylabel("Pitch / Component index")
+plt.show()
+
+import matplotlib.pyplot as plt
+plt.figure()
+#plt.imshow(H_v, aspect='auto', origin='lower')
+#plt.imshow(Y[:,140:160], aspect='auto', origin='lower')
+plt.imshow(H, aspect='auto', origin='lower')
+#plt.imshow(Y, aspect='auto', origin='lower')
+plt.colorbar()
+plt.title("Activation matrix W")
+plt.xlabel("Time frames")
+plt.ylabel("Pitch / Component index")
+plt.show()
+
+error = np.linalg.norm(spectrogram_norm - W @ H)
+normV = np.linalg.norm(spectrogram_norm)
+print("Relative error:", error / normV)
 
 """**Читаем исходный файл**"""
 
