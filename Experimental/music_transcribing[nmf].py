@@ -11,9 +11,6 @@ Original file is located at
 Из всех библиотек с реализацией NMF пока остановился на Nimfa, не пойдет с ней - буду пробовать работать с NMFToolbox. Перед тем как запускать код дальше надо установить Nimfa.
 """
 
-import numpy as np
-np.Inf = np.inf
-
 pip install nimfa
 
 !grep -rl "np.mat" /usr/local/lib/python3.12/dist-packages/nimfa | xargs sed -i 's/np.mat/np.asmatrix/g'
@@ -63,15 +60,17 @@ def harmonic_template(p, coef=3, t=0.1):
   tpls = []
   m = int(np.floor(fu / fq))
   for fr in range(m):
-    i_s = int(np.ceil(np.log2(((fq * (fr+1) * (1-t/2)) / 440)) * (12 * coef) + 49 * coef))
-    i_f = int(np.floor(np.log2(((fq * (fr+1) * (1+t/2)) / 440)) * (12 * coef) + 49 * coef))
-    for k in range(i_s-1,i_f):
+    i_s = max(0,int(np.ceil(np.log2(((fq * (fr+1) * (1-t/2)) / 440)) * (12 * coef) + 49 * coef))-1)
+    i_f = min(int(np.floor(np.log2(((fq * (fr+1) * (1+t/2)) / 440)) * (12 * coef) + 49 * coef)), 88 * coef)
+    if(i_s==i_f):
+      vec[i_s] = 1
+    for k in range(i_s,i_f):
       vec[k] = 1
   return vec
 def init_W(coef=3, t=0.1):
   vec = np.zeros((88 * coef, 88))
   for i in range(88):
-    vec[:,i] = harmonic_template(i+1,coef,t)
+    vec[:,i] = harmonic_template(i,coef,t)
   return vec
 
 def sparsity(x, eps=1e-10):
@@ -94,7 +93,10 @@ elif(x.dtype==np.int16):
 else:
   raise ValueError(f"Unsupported sample type: {x.dtype}")
 onsets = librosa.onset.onset_detect(y=x, sr=f_s, hop_length=HOP,units='frames')
-spectrogram = np.abs(librosa.cqt(x, fmin=librosa.note_to_hz('A0'), bins_per_octave=12 * K, n_bins=88 * K, hop_length=HOP))
+nof_bins = int(np.floor(np.log2(f_s / (2 * librosa.note_to_hz('A0')))) * (12 * K))
+print("nof_bins=",nof_bins)
+spectrogram = np.abs(librosa.cqt(x,sr=f_s, fmin=librosa.note_to_hz('A0'), bins_per_octave=12 * K, n_bins=88 * K, hop_length=HOP))
+#spectrogram = np.abs(librosa.cqt(x,sr=f_s, fmin=librosa.note_to_hz('A0'), bins_per_octave=12 * K, n_bins=nof_bins, hop_length=HOP))
 spectrogram_norm = norm_log(spectrogram, g)
 spectrogram_norm = librosa.util.normalize(spectrogram_norm, norm = 2, axis = 0, threshold = 0.05)
 
@@ -103,12 +105,106 @@ print(max_index)  # 1
 print(sparsity(spectrogram_norm[:,onsets[10]+5]))
 #spectrogram_compressed = np.log(1+gamma*spectrogram)
 
-W_i = init_W(3,0.01)
+W_i = init_W(3,0.08)
 import matplotlib.pyplot as plt
 plt.figure()
 #plt.imshow(H_v, aspect='auto', origin='lower')
 #plt.imshow(Y[:,140:160], aspect='auto', origin='lower')
 plt.imshow(spectrogram_norm, aspect='auto', origin='lower')
+#plt.imshow(W_i, aspect='auto', origin='lower')
+#plt.imshow(Y, aspect='auto', origin='lower')
+plt.colorbar()
+plt.title("Activation matrix W")
+plt.xlabel("Time frames")
+plt.ylabel("Pitch / Component index")
+plt.show()
+
+def build_W0(sr,
+             bins_per_octave,
+             n_bins,
+             fmin,
+             n_harmonics=10,
+             decay=1.0,
+             sigma=1.5,
+             inharmonicity=0.0):
+
+    # CQT frequency grid (MUST match your spectrogram)
+    freqs = librosa.cqt_frequencies(
+        n_bins=n_bins,
+        fmin=fmin,
+        bins_per_octave=bins_per_octave
+    )
+
+    midi_notes = np.arange(21, 21 + 88)  # piano
+    W0 = np.zeros((n_bins, len(midi_notes)))
+
+    for i, m in enumerate(midi_notes):
+        f0 = librosa.midi_to_hz(m)
+        template = np.zeros(n_bins)
+
+        for h in range(1, n_harmonics + 1):
+            # optional piano inharmonicity
+            fh = h * f0 * np.sqrt(1 + inharmonicity * h**2)
+
+            if fh >= sr / 2:
+                break
+
+            # nearest bin
+            idx = np.argmin(np.abs(freqs - fh))
+
+            # Gaussian spread
+            k = np.arange(n_bins)
+            peak = np.exp(-(k - idx)**2 / (2 * sigma**2))
+
+            template += (1 / (h ** decay)) * peak
+
+        # normalize (critical)
+        template /= np.linalg.norm(template) + 1e-10
+
+        W0[:, i] = template
+
+    return W0
+
+W_0 = build_W0(sr=f_s, bins_per_octave=12*K, n_bins=88 * K, fmin=librosa.note_to_hz('A0'))
+print(W_i)
+
+print(W_i.shape)
+import matplotlib.pyplot as plt
+plt.figure()
+#plt.imshow(H_v, aspect='auto', origin='lower')
+#plt.imshow(Y[:,140:160], aspect='auto', origin='lower')
+plt.imshow(W_0, aspect='auto', origin='lower')
+#plt.imshow(W_i, aspect='auto', origin='lower')
+#plt.imshow(Y, aspect='auto', origin='lower')
+plt.colorbar()
+plt.title("Activation matrix W")
+plt.xlabel("Time frames")
+plt.ylabel("Pitch / Component index")
+plt.show()
+
+H_0 = np.random.rand(88, spectrogram_norm.shape[1])
+#nmf = nimfa.Nmf(spectrogram_compressed, seed='fixed', W=W_temp)
+nmf = nimfa.Nmf(
+    spectrogram_norm,
+    rank=K,
+    seed='fixed',
+    W=W_0,
+    H=H_0,
+    max_iter=200,
+    beta=1, sparsity=(None, 0.2),
+    objective='div',
+    update='divergence'
+)
+nmf_fit = nmf()
+W_est = nmf_fit.basis()
+H_est = nmf_fit.coef()
+
+import matplotlib.pyplot as plt
+plt.figure()
+#plt.imshow(H_v, aspect='auto', origin='lower')
+#plt.imshow(Y[:,140:160], aspect='auto', origin='lower')
+plt.imshow(W_est, aspect='auto', origin='lower')
+#plt.imshow(W_i, aspect='auto', origin='lower')
 #plt.imshow(Y, aspect='auto', origin='lower')
 plt.colorbar()
 plt.title("Activation matrix W")
@@ -117,6 +213,372 @@ plt.ylabel("Pitch / Component index")
 plt.show()
 
 print(onsets)
+print(len(onsets))
+
+from scipy.ndimage import label
+def enforce_min_duration(B, min_len=10):
+    for q in range(B.shape[0]):
+        labels, n = label(B[q])
+        for i in range(1, n+1):
+            if np.sum(labels == i) < min_len:
+                B[q][labels == i] = 0
+    return B
+def matrix_filter(H):
+  H_c = H.copy()
+  for i in range(H_c.shape[0]):
+    for j in range(H_c.shape[1]):
+      v = 0
+      if ((j-1)>=0):
+        v += H_c[i,j-1]
+      if((j+1)<H_c.shape[1]):
+        v += H_c[i,j+1]
+      v += H_c[i,j]
+      v = v / 3
+      H_c[i,j] = v
+  return H_c
+def rowwise_norm(H, eps=1e-8):
+    Hn = H.copy()
+    for q in range(H.shape[0]):
+        m = np.max(Hn[q])
+        if m > eps:
+            Hn[q] /= m
+    return Hn
+#Y = norm_dynamic_range(H_new)
+Y = rowwise_norm(H_est)
+Y = matrix_filter(Y)
+#Y = unsharp_matrix(Y)
+#Y = np.maximum(0, Y)
+#Y = freq_ftr(Y)
+#Y = binarize_matrix(Y)
+#Y = track_notes(Y)
+Y = enforce_min_duration(Y)
+import matplotlib.pyplot as plt
+plt.figure()
+#plt.imshow(H_v, aspect='auto', origin='lower')
+#plt.imshow(Y[:,140:160], aspect='auto', origin='lower')
+plt.imshow(Y, aspect='auto', origin='lower')
+#plt.imshow(W_i, aspect='auto', origin='lower')
+#plt.imshow(Y, aspect='auto', origin='lower')
+plt.colorbar()
+plt.title("Activation matrix W")
+plt.xlabel("Time frames")
+plt.ylabel("Pitch / Component index")
+plt.show()
+
+def pitch_energy(fp,p):
+  en = 0
+  en_t = np.sum(np.square(fp))
+  h = pitch_harmonics(p)
+  h = [m for m in h if m <= 87]
+  alpha = -1
+  #print(h)
+  for l in range(len(h)):
+    en += (l+2)**alpha * fp[h[l]]**2
+    #print(l,h[l])
+  #print(en)
+  return float(en)
+'''def transcribe_frame(fr,pol=9):
+  peaks = [int(p) for p in top_k_indices(fr,20)]
+  notes = []
+  thr = np.median(fr,axis=0)
+  thr += 0.1
+  alpha = -1
+  print(fr.shape)
+  for p in peaks:
+    #a = [p+12,p+19,p+24,p+28,p+31,p+34,p+36]
+    if(fr[p]>thr):
+      a = pitch_harmonics(p)
+      sc = 0
+      for pt in range(len(a)):
+        if a[pt] in peaks:
+          sc += (pt+2)**alpha
+      #notes.append((p,float(fr[p,0]),len(set(a) & set(peaks))))
+      #notes.append((p,float(fr[p,0]),sc))
+      notes.append((p,pitch_energy(fr,p)))
+  notes = sorted(notes, key=lambda x: x[1],reverse=True)
+  return notes
+  print(notes)'''
+'''def top_k_indices(v, k):
+    v = np.asarray(v).ravel()      # ensure 1D ndarray
+    return np.argpartition(v, -k)[-k:]'''
+
+def top_k_indices(v, k):
+    v = np.asarray(v).ravel()          # ensure 1D
+    idx = np.argpartition(v, -k)[-k:]  # indices of k largest elements
+    idx = idx[np.argsort(v[idx])[::-1]]  # sort them by value (descending)
+    return idx
+def pitch_harmonics(p):
+  r = [p+12,p+19,p+24,p+28,p+31,p+34,p+36]
+  return [m for m in r if m <= 87]
+def transcribe_frame(fr,thr=0.15):
+  frn = fr.copy()
+  peaks = [int(p) for p in top_k_indices(fr,20)]
+  #peaks = [int(p) for p in range(88) if fr[p] > 0.25]
+  peaks = sorted(peaks)
+  #print(peaks)
+  alpha = 0.5
+  rv_start = 0.7
+  #rv_start = 1
+  notes = []
+  for p in range(len(peaks)):
+    frns = frn.copy()
+    sc = 0
+    en = fr[peaks[p]]
+    pch = pitch_harmonics(peaks[p])
+    ind = []
+    for idx in range(len(pch)):
+      if(frn[pch[idx]]>rv_start*(alpha)**idx):
+        sc += 1/(idx+1)
+        '''* float(frn[pch[idx]])**2'''
+        frn[pch[idx]] -= rv_start*(alpha)**idx
+        ind.append(idx)
+    #score correction
+    '''if(peaks[p]<=87):
+      sc *= 2**((peaks[p] - 69) / 12)'''
+    #sc *= float(frn[peaks[p]]/(np.max(frn)))
+    #notes.append((peaks[p],sc))
+    '''if(float(sc*fr[peaks[p]])<=thr):
+      for i in ind:
+        frn[pch[i]] += rv_start*(alpha)**i'''
+    if(float(sc*fr[peaks[p]])<=thr):
+      frn = frns
+    notes.append((peaks[p],float(sc*fr[peaks[p]])))
+  notes = sorted(notes, key=lambda x: x[1],reverse=True)
+  notes = list(filter(lambda t: t[1] > thr, notes))
+  return [t[0] for t in notes]
+  #print(notes)
+
+def transcribe_onset(m):
+  st = np.zeros((88,))
+  #ln = m.shape[1] // 2
+  r = []
+  #print("ln",ln)
+  for j in range(m.shape[1]):
+    for l in transcribe_frame(m[:,j]):
+      st[l] +=1
+  ap = [int(p) for p in top_k_indices(st,88)]
+  s = 0
+  summa = np.sum(st)
+  for el in ap:
+    s += st[el]
+    if(s>=round((0.7 * summa)) or st[el]==0):
+      break
+    r.append(el)
+    #print(el,st[el])
+    #if(st[el]>ln):
+    #  r.append(el)
+  #print(np.sum(st))
+
+  #print(st[ap[0]],st[ap[1]])
+  #return ap
+  #print(st[ap[0]],st[ap[1]])
+  #print(st)
+  return r
+def transcribe_H(Y,os):
+  tr = np.zeros(Y.shape)
+  for idx in range(len(os)-1):
+    nts = transcribe_onset(Y[:,os[idx]:os[idx]+10])
+    for n in nts:
+      tr[n,os[idx]:os[idx]+10] = 1
+    for i in range(os[idx]+10,os[idx+1]):
+      for n in nts:
+        if(np.max(Y[n,i-4:i+4])>0.5):
+          tr[n,i] = 1
+        #else:
+        #  nts.remove(n)
+      #if(len(nts)==0):
+        #break
+  '''nts = transcribe_onset(Y[:,os[len(os)-1]:os[len(os)-1]+10])
+  for n in nts:
+    tr[n,os[len(os)-1]:os[len(os)-1]+10] = 1
+  print(Y.shape[1])
+  for i in range(os[len(os)-1]+10,Y.shape[1]-5):
+    for n in nts:
+      if(np.max(Y[n,i-4:i+5])>0.5):
+        tr[n,i] = 1'''
+  return tr
+
+def pitch_energy(fp,p):
+  en = 0
+  en_t = np.sum(np.square(fp))
+  h = pitch_harmonics(p)
+  h = [m for m in h if m <= 87]
+  #print(h)
+  for l in h:
+    en += fp[l]**2
+  #print(en)
+  return float(en/en_t)
+  #return en[0,0]
+#print(transcribe_frame(H_m[:,1]))
+print(transcribe_onset(Y[:,479:489]))
+#print(transcribe_frame(Y[:,152]))
+#print(Y[38,203],Y[39,203])
+
+trscrptn = transcribe_H(Y,onsets)
+trscrptn[0,:] = 0
+trscrptn = enforce_min_duration(trscrptn,min_len=10)
+import matplotlib.pyplot as plt
+plt.figure()
+#plt.imshow(H_v, aspect='auto', origin='lower')
+#plt.imshow(Y[:,140:160], aspect='auto', origin='lower')
+#plt.imshow(Y[:,479:489], aspect='auto', origin='lower')
+plt.imshow(trscrptn, aspect='auto', origin='lower')
+#plt.imshow(Y, aspect='auto', origin='lower')
+plt.colorbar()
+plt.title("Activation matrix H")
+plt.xlabel("Time frames")
+plt.ylabel("Pitch / Component index")
+plt.show()
+
+from scipy.ndimage import label
+def shift(x, k, fill=0):
+    y = np.full_like(x, fill)
+    if k > 0:
+        y[k:] = x[:-k]
+    elif k < 0:
+        y[:k] = x[-k:]
+    else:
+        y = x.copy()
+    return y
+def compute_W(spectrogram_norm,onsets):
+  W = np.zeros((88*K,88))
+  pitch_list = []
+  for i in range(len(onsets)):
+    m_index = np.argmax(spectrogram_norm[:,onsets[i]])
+    s_index = np.argsort(spectrogram_norm[:,onsets[i]])[-2]
+    if((m_index // K) not in pitch_list and m_index % K == 0 and spectrogram_norm[s_index,onsets[i]] < 0.9 * spectrogram_norm[m_index,onsets[i]]):
+      W[:,m_index // K] = spectrogram_norm[:,onsets[i]]
+      pitch_list.append(int(m_index // K))
+  pitch_list.sort()
+  for i in range(88):
+    if(i not in pitch_list):
+      if(i < max(pitch_list)):
+        for en in pitch_list:
+          if(en > i):
+            W[:,i] = shift(W[:,en],(i-en)*K)
+            break
+      else:
+        W[:,i] = shift(W[:,max(pitch_list)],(i-en)*K)
+  W_norm = W / np.linalg.norm(W, axis=0, keepdims=True)
+  #W_norm = W / (np.max(W, axis=0, keepdims=True) + 1e-12)
+  #print(pitch_list)
+  return W_norm
+  #max_index = np.argmax(spectrogram_norm[:,onsets])
+  #tmpl = harmonic_template(39,3,0.08)
+  #r = spectrogram_norm[:,onsets[0]] * tmpl
+  #max_index = np.argmax(r)'''
+import numpy as np
+#print(max_index)
+def rowwise_norm(H, eps=1e-8):
+    Hn = H.copy()
+    for q in range(H.shape[0]):
+        m = np.max(Hn[q])
+        if m > eps:
+            Hn[q] /= m
+    return Hn
+def matrix_filter(H):
+  H_c = H.copy()
+  for i in range(H_c.shape[0]):
+    for j in range(H_c.shape[1]):
+      v = 0
+      if ((j-1)>=0):
+        v += H_c[i,j-1]
+      if((j+1)<H_c.shape[1]):
+        v += H_c[i,j+1]
+      v += H_c[i,j]
+      v = v / 3
+      H_c[i,j] = v
+  return H_c
+def enforce_min_duration(B, min_len=10):
+    for q in range(B.shape[0]):
+        labels, n = label(B[q])
+        for i in range(1, n+1):
+            if np.sum(labels == i) < min_len:
+                B[q][labels == i] = 0
+    return B
+def polyphony_autocorr(V, max_lag=200, threshold=0.3):
+    F, T = V.shape
+    P = np.zeros(T)
+
+    for t in range(T):
+        v = V[:, t]
+        v = v / (np.max(v) + 1e-10)
+
+        # autocorrelation (positive lags only)
+        R = np.correlate(v, v, mode='full')[F-1:F-1+max_lag]
+
+        # normalize
+        R /= np.max(R) + 1e-10
+
+        # peak counting
+        peaks = (R[1:-1] > R[:-2]) & (R[1:-1] > R[2:])
+        peaks = peaks & (R[1:-1] > threshold)
+
+        P[t] = np.sum(peaks)
+
+    return P
+
+
+W_i = compute_W(spectrogram_norm, onsets)
+import matplotlib.pyplot as plt
+plt.figure()
+#plt.imshow(H_v, aspect='auto', origin='lower')
+#plt.imshow(Y[:,140:160], aspect='auto', origin='lower')
+#plt.imshow(spectrogram_norm, aspect='auto', origin='lower')
+plt.imshow(W_i, aspect='auto', origin='lower')
+#plt.imshow(Y, aspect='auto', origin='lower')
+plt.colorbar()
+plt.title("Activation matrix W")
+plt.xlabel("Time frames")
+plt.ylabel("Pitch / Component index")
+plt.show()
+
+
+
+H_i = np.random.rand(88, spectrogram_norm.shape[1])
+#nmf = nimfa.Nmf(spectrogram_compressed, seed='fixed', W=W_temp)
+nmf = nimfa.Nmf(
+    spectrogram_norm,
+    rank=K,
+    seed='fixed',
+    W=W_i,
+    H=H_i,
+    max_iter=200,
+    beta=1, sparsity=(None, 0.2),
+    objective='div'
+)
+nmf_fit = nmf()
+W_est = nmf_fit.basis()
+H_est = nmf_fit.coef()
+
+def norm_dynamic_range(H):
+  H_min = np.min(H)
+  H_max = np.max(H)
+  H_mean = np.mean(H)
+  Z = (H-H_mean)/(H_max-H_min)
+  Y = 1 / (1+np.exp(-Z))
+  return Y
+H_est = rowwise_norm(H_est)
+H_est = matrix_filter(H_est)
+H_est = enforce_min_duration(H_est)
+#H_est = norm_dynamic_range(H_est)
+import matplotlib.pyplot as plt
+plt.figure()
+#plt.imshow(H_v, aspect='auto', origin='lower')
+#plt.imshow(Y[:,140:160], aspect='auto', origin='lower')
+#plt.imshow(spectrogram_norm, aspect='auto', origin='lower')
+plt.imshow(H_est, aspect='auto', origin='lower')
+#plt.imshow(Y, aspect='auto', origin='lower')
+plt.colorbar()
+plt.title("Activation matrix W")
+plt.xlabel("Time frames")
+plt.ylabel("Pitch / Component index")
+plt.show()
+
+print(shift([1,2,3,4,5],3))
+
+print(spectrogram_norm[:,onsets[1]+10].shape)
+print(polyphony_autocorr(spectrogram_norm[:,onsets[4]].reshape((88 * K,1))))
 
 import numpy as np
 
@@ -223,15 +685,15 @@ def snmf(V, rank, l1_target, l2_target, num_iters=100, mu=1e-3, seed=None):
 )'''
 #V = np.abs(np.random.randn(50, 30))
 W, H = snmf(
-    spectrogram_norm[:,87:287],
-    rank=10,
+    spectrogram_norm[:,300:325],
+    rank=5,
     l1_target=10.0,   # less restrictive
     l2_target=5.0,
     num_iters=100,
     mu=1e-2
 )
 
-print("Reconstruction error:", np.linalg.norm(spectrogram_norm[:,87:287] - W @ H))
+print("Reconstruction error:", np.linalg.norm(spectrogram_norm[:,300:325] - W @ H))
 
 import matplotlib.pyplot as plt
 plt.figure()
@@ -267,6 +729,7 @@ from scipy.io import wavfile
 import numpy as np
 import librosa
 import nimfa
+np.Inf = np.inf
 gamma = 100
 fft_bins = 2048
 onsets_mode = True
@@ -361,8 +824,6 @@ onsets = librosa.onset.onset_detect(y=x, sr=f_s, hop_length=fft_bins//2,units='f
 
 print(onsets)
 spectrogram = np.abs(librosa.stft(x, n_fft=fft_bins,hop_length=fft_bins//2))
-for i in range(spectrogram.shape[0]):
-  spectrogram[i,:] *= (f_s / 2 * fft_bins)
 spectrogram_compressed = np.log(1+gamma*spectrogram)
 pitches = [x+21 for x in range(88)]
 freq_res = f_s/(2 * (fft_bins//2+1))
@@ -385,8 +846,9 @@ nmf = nimfa.Nmf(
     W=W_temp,
     H=H_temp,
     max_iter=200,
-    beta=1, sparsity=(None, 0.2),
-    objective='div'
+    objective='div',
+    update='divergence',
+    beta=1, sparsity=(None, 0.2)
 )
 nmf_fit = nmf()
 W_est = nmf_fit.basis()
@@ -396,8 +858,6 @@ if(onsets_mode):
   H_new = H_est[1::2]
 else:
   H_new = H_est.copy()
-
-
 
 import matplotlib.pyplot as plt
 plt.figure()
@@ -424,6 +884,152 @@ print(x.shape)
 print(x.dtype)
 print(np.min(x), np.max(x))
 print(np.isnan(x).any(), np.isinf(x).any())
+
+from scipy.io import wavfile
+import numpy as np
+import librosa
+import nimfa
+np.Inf = np.inf
+gamma = 100
+fft_bins = 2048
+onsets_mode = True
+if(onsets_mode):
+  pitch_count = 88 * 2
+else:
+  pitch_count = 88
+f_s, x = wavfile.read("/content/Prelude-in-E-Minor-Nr-4.wav")
+print(f_s)        # sample rate
+print(x.dtype)   # int16, int32, etc.
+print(x.shape)   # (N,) mono or (N, channels)
+#print(x[100000])
+def init_nmf_template_pitch(K, pitch_set, freq_res, tol_pitch=0.05):
+    """Initializes template matrix for a given set of pitches
+
+    Notebook: C8/C8S3_NMFSpecFac.ipynb
+
+    Args:
+        K (int): Number of frequency points
+        pitch_set (np.ndarray): Set of fundamental pitches
+        freq_res (float): Frequency resolution
+        tol_pitch (float): Relative frequency tolerance for the harmonics (Default value = 0.05)
+
+    Returns:
+        W (np.ndarray): Nonnegative matrix of size K x R with R = len(pitch_set)
+    """
+    R = len(pitch_set)
+    W = np.zeros((K, R))
+    for r in range(R):
+        W[:, r] = template_pitch(K, pitch_set[r], freq_res, tol_pitch=tol_pitch)
+    return W
+def init_nmf_template_pitch_onset(K, pitch_set, freq_res, tol_pitch=0.05):
+    """Initializes template matrix with onsets for a given set of pitches
+
+    Notebook: C8/C8S3_NMFSpecFac.ipynb
+
+    Args:
+        K (int): Number of frequency points
+        pitch_set (np.ndarray): Set of fundamental pitches
+        freq_res (float): Frequency resolution
+        tol_pitch (float): Relative frequency tolerance for the harmonics (Default value = 0.05)
+
+    Returns:
+        W (np.ndarray): Nonnegative matrix of size K x (2R) with R = len(pitch_set)
+    """
+    R = len(pitch_set)
+    W = np.zeros((K, 2*R))
+    for r in range(R):
+        W[:, 2*r] = 0.1
+        W[:, 2*r+1] = template_pitch(K, pitch_set[r], freq_res, tol_pitch=tol_pitch)
+    return W
+def sparse_H(H,onsets):
+  H_r = H.copy()
+  for i in range(H_r.shape[1]):
+    if(i in onsets or (i-1) in onsets or (i-2) in onsets):
+      H[1::2,i] = 0
+    else:
+      H[0::2,i] = 0
+  return H_r
+def template_pitch(K, pitch, freq_res, tol_pitch=0.05):
+    """Defines spectral template for a given pitch
+
+    Notebook: C8/C8S3_NMFSpecFac.ipynb
+
+    Args:
+        K (int): Number of frequency points
+        pitch (float): Fundamental pitch
+        freq_res (float): Frequency resolution
+        tol_pitch (float): Relative frequency tolerance for the harmonics (Default value = 0.05)
+
+    Returns:
+        template (np.ndarray): Nonnegative template vector of size K
+    """
+    max_freq = K * freq_res
+    pitch_freq = 2**((pitch - 69) / 12) * 440
+    max_order = int(np.ceil(max_freq / ((1 - tol_pitch) * pitch_freq)))
+    #print(max_freq,pitch_freq,max_order)
+    template = np.zeros(K)
+    for m in range(1, max_order + 1):
+        min_idx = max(0, int((1 - tol_pitch) * m * pitch_freq / freq_res))
+        max_idx = min(K-1, int((1 + tol_pitch) * m * pitch_freq / freq_res))
+        template[min_idx:max_idx+1] = 1 / m
+    return template
+
+if(x.dtype==np.int32):
+  x = x / (2**31)
+elif(x.dtype==np.int16):
+  x = x / (2**15)
+else:
+  raise ValueError(f"Unsupported sample type: {x.dtype}")
+onsets = librosa.onset.onset_detect(y=x, sr=f_s, hop_length=fft_bins//2,units='frames')
+
+print(onsets)
+spectrogram = np.abs(librosa.stft(x, n_fft=fft_bins,hop_length=fft_bins//2))
+spectrogram_compressed = np.log(1+gamma*spectrogram)
+pitches = [x+21 for x in range(88)]
+freq_res = f_s/(2 * (fft_bins//2+1))
+
+if(onsets_mode):
+  W_temp = init_nmf_template_pitch_onset(fft_bins//2+1,pitches,freq_res)
+else:
+  W_temp = init_nmf_template_pitch(fft_bins//2+1,pitches,freq_res)
+#W_temp = np.random.rand(spectrogram_compressed.shape[0],88)
+H_temp = np.random.rand(pitch_count, spectrogram_compressed.shape[1])
+if(onsets_mode):
+  H_temp = sparse_H(H_temp,onsets)
+#nmf = nimfa.Nmf(spectrogram_compressed, seed='fixed', W=W_temp)
+print(W_temp.shape)
+print(H_temp.shape)
+'''nmf = nimfa.Nmf(
+    spectrogram_compressed,
+    rank=pitch_count,
+    seed='fixed',
+    W=W_temp,
+    H=H_temp,
+    max_iter=200,
+    beta=1, sparsity=(None, 0.2),
+    update='divergence',
+    objective='div'
+)'''
+
+nmf = nimfa.Snmf(
+    spectrogram_compressed,
+    rank=pitch_count,
+    seed='fixed',
+    W=W_temp,
+    H=H_temp,
+    max_iter=200,
+    beta=1, sparsity=(None, 0.2),
+    update='divergence',
+    objective='div'
+)
+nmf_fit = nmf()
+W_est = nmf_fit.basis()
+H_est = nmf_fit.coef()
+
+if(onsets_mode):
+  H_new = H_est[1::2]
+else:
+  H_new = H_est.copy()
 
 from scipy.ndimage import label
 from scipy.ndimage import gaussian_filter1d
@@ -618,7 +1224,7 @@ def top_k_indices(v, k):
 def pitch_harmonics(p):
   r = [p+12,p+19,p+24,p+28,p+31,p+34,p+36]
   return [m for m in r if m <= 87]
-def transcribe_frame(fr,thr=0.25):
+def transcribe_frame(fr,thr=0.18):
   frn = fr.copy()
   peaks = [int(p) for p in top_k_indices(fr,20)]
   #peaks = [int(p) for p in range(88) if fr[p] > 0.25]
@@ -626,7 +1232,6 @@ def transcribe_frame(fr,thr=0.25):
   #print(peaks)
   alpha = 0.5
   rv_start = 0.7
-  #rv_start = 1
   notes = []
   for p in range(len(peaks)):
     frns = frn.copy()
@@ -811,293 +1416,6 @@ print(sorted(fh))
 
 print(H_v)
 
-"""# Попробуем готовый NMFD"""
-
-from scipy.io import wavfile
-import numpy as np
-import librosa
-from convolutive_MM import convlutive_MM
-import torch
-from torchnmf.nmf import NMFD
-gamma = 1
-f_s, x = wavfile.read("/content/FChopinPreludeOp28n4.wav")
-if(x.dtype==np.int32):
-  x = x / (2**31)
-elif(x.dtype==np.int16):
-  x = x / (2**15)
-else:
-  raise ValueError(f"Unsupported sample type: {x.dtype}")
-X = np.abs(librosa.stft(x, n_fft=2048,hop_length=1024))
-print(f_s)        # sample rate
-print(x.dtype)   # int16, int32, etc.
-print(x.shape)   # (N,) mono or (N, channels)
-print(x[100000])
-def cnmf(V, n_components=8, n_lags=10, n_iter=100, eps=1e-9):
-    """
-    V: (F, T) non-negative matrix (e.g. magnitude spectrogram)
-    W: (F, K, L)
-    H: (K, T)
-    """
-    F, T = V.shape
-    K = n_components
-    L = n_lags
-
-    # initialize
-    W = np.random.rand(F, K, L)
-    H = np.random.rand(K, T)
-
-    for it in range(n_iter):
-        print("Iteration number:",it)
-        # reconstruct V_hat
-        V_hat = np.zeros_like(V)
-        for k in range(K):
-            for l in range(L):
-                V_hat[:, l:] += np.outer(W[:, k, l], H[k, :-l or None])
-
-        # update H
-        for k in range(K):
-            num = np.zeros(T)
-            den = np.zeros(T) + eps
-            for l in range(L):
-                Wkl = W[:, k, l][:, None]
-                num[l:] += (Wkl * V[:, l:]).sum(axis=0)
-                den[l:] += (Wkl * V_hat[:, l:]).sum(axis=0)
-            H[k] *= num / den
-
-        # update W
-        for k in range(K):
-            for l in range(L):
-                num = (V[:, l:] * H[k, :-l or None]).sum(axis=1)
-                den = (V_hat[:, l:] * H[k, :-l or None]).sum(axis=1) + eps
-                W[:, k, l] *= num / den
-
-        if it % 10 == 0:
-            err = np.linalg.norm(V - V_hat)
-            print(f"iter {it:3d} | error {err:.3f}")
-
-    return W, H
-#res = cnmf(X,88,10,100,eps=1e-9)
-S = torch.from_numpy(X).float().unsqueeze(0)
-model = NMFD(S.shape, rank=88, T=10)  # rank = components, T = time lags
-model.fit(S, max_iter=200)
-# Extract factors
-W = model.W.detach().cpu().numpy()  # (F, rank, T)
-H = model.H.detach().cpu().numpy()  # (batch, rank, time)
-
-# Remove batch dimension from H
-H = H[0]
-
-pip install torchnmf
-
-print(H.shape)
-print(H[:,100])
-
-import matplotlib.pyplot as plt
-
-vmax = np.percentile(H, 99)
-
-plt.figure(figsize=(10,4))
-plt.imshow(
-    H,
-    aspect='auto',
-    origin='lower',
-    cmap='magma',
-    vmin=0,
-    vmax=vmax
-)
-plt.colorbar()
-plt.title("CNMF activations (H) – clipped at 99th percentile")
-plt.show()
-
-"""# Пробуем CNMF (имплементация из libnmfd)"""
-
-pip install libnmfd
-
-
-
-"""# Обнаружение начал нот (Onsets detection)
-
-Будем использовать подход, называемый Spectral Difference, вычисляя результат по формуле вот отсюда: https://www.iro.umontreal.ca/~pift6080/H09/documents/presentations/xavier_bello_tutorial.pdf
-"""
-
-def H(x):
-  return (x+abs(x))/2
-def summf(v1,v2):
-  #v1 - spectral coefficients vector at moment n
-  #v2 - spectral coefficients vector at moment (n+1)
-  l = v1.shape[0]
-  assert l == v2.shape[0]
-  s = 0
-  for i in range(l):
-    s += (H(v2[i]-v1[i]))**2
-  return s
-def spec_diff(sp):
-  res = []
-  for i in range(sp.shape[1]-1):
-    res.append(float(summf(sp[:,i],sp[:,i+1])))
-  return res
-H(5)
-def eval_thrshld(d,n,M=100,abs_thrsh=0.1,lam=1.0):
-  r = abs_thrsh
-  n_s = n-M
-  n_f = n+M
-  if(n<M):
-    n_s = M
-  if(n+M>=len(d)):
-    n_f = len(d)
-  r += lam * np.median(d[n_s:n_f])
-  return r
-'''def peak_detect(data):
-  res = np.zeros((len(data),))
-  lval = 0
-  for i in range(len(data)):
-    if(data[i]>=eval_thrshld(data,i) and (i-lval)>=20):
-      res[i] = 1
-      lval = i
-  return res'''
-def peak_detect(data):
-  #res = np.zeros((len(data),))
-  res = []
-  lval = 0
-  for i in range(len(data)):
-    if(data[i]>=eval_thrshld(data,i) and (i-lval)>=20):
-      res.append(i)
-      lval = i
-  return res
-data = spec_diff(spectrogram_compressed)
-res = peak_detect(data)
-def sparse_H(H,onsets):
-  H_r = H.copy()
-  for i in range(H_r.shape[1]):
-    if(i in onsets or (i-1) in onsets or (i+1) in onsets):
-      H[1::2,i] = 0
-    else:
-      H[0::2,i] = 0
-  return H_r
-print(res)
-import matplotlib.pyplot as plt
-
-import numpy as np
-def shift_right(x, k):
-    if(k==0):
-      return x
-    y = np.zeros_like(x)
-    y[k:] = x[:-k]
-    return y
-def note_template(pitch, alpha=0.5):
-  r = np.zeros((88,))
-  #first eight harmonics of some pitch
-  l = [0,12,19,24,28,31,34,36]
-  r[l]=1
-  #print(pitch)
-  r = shift_right(r,pitch)
-  return r
-def top_k_indices(v, k):
-    return np.argsort(v)[-k:][::-1]
-def rms(x):
-    return np.sqrt(np.mean(np.square(x)))
-def process_frame(s,k=3,en_thrsh=0.4):
-    assert s.shape[0] == 88 and s.shape[1] == 1
-    notes = []
-    s_c = s.copy()
-    s_c = np.asarray(s, dtype=float).squeeze()
-    #print(type(s_c))
-    #print("s_c=",s_c)
-    s_pitches = top_k_indices(s_c,k)
-    #print("s_pitches=",s_pitches)
-    for l in s_pitches:
-      #print(l)
-      r = rms(np.dot(note_template(l),s_c))
-      #print("r=",r)
-      if(r>en_thrsh):
-        notes.append(int(l))
-    return notes
-def note_tracking(mtr):
-  r = np.zeros(mtr.shape)
-  for i in range(mtr.shape[1]):
-    ind = process_frame(mtr[:,i])
-    for k in ind:
-      r[k,i] = 1
-  return r
-
-def note_tracking_paper_style(H, delta=0.1, win=10):
-    Q, T = H.shape
-    R = np.zeros_like(H, dtype=np.uint8)
-
-    # 1. Per-pitch normalization (critical)
-    '''keepdims=True'''
-    Hn = H / (np.max(H, axis=1) + 1e-9)
-
-    for q in range(Q):
-        for t in range(T):
-
-            # local mean (zero-padded)
-            t0 = max(0, t - win)
-            t1 = min(T, t + win + 1)
-            local_mean = np.mean(Hn[q, t0:t1])
-
-            # adaptive threshold
-            thresh = local_mean + delta
-
-            # onset condition (THIS is what you missed)
-            if (
-                Hn[q, t] > thresh and
-                (t == 0 or Hn[q, t] > Hn[q, t - 1])
-            ):
-                R[q, t] = 1
-
-    return R
-H_n = np.log(1+H_est)
-print(H_n.shape)
-#H_n = note_tracking(H_n)
-print(H_n.shape)
-print(H_n[:,100].shape)
-
-plt.figure()
-#plt.imshow(np.log(1+200*H_est[1::2]), aspect='auto', origin='lower')
-plt.imshow(note_tracking_paper_style(H_est), aspect='auto', origin='lower')
-plt.colorbar()
-plt.title("Activation matrix H")
-plt.xlabel("Time frames")
-plt.ylabel("Pitch / Component index")
-plt.show()
-
-
-
-def pitch_energy_compensation(H, gamma=0.7):
-    """
-    H: shape (88, T)
-    """
-    pitches = np.arange(88)
-    weights = 2 ** (gamma * pitches / 12)
-    weights = weights / weights.mean()  # normalize
-
-    return H * weights[:, None]
-H_n = np.log(1+H_est)
-H_n = pitch_energy_compensation(H_n[1::2])
-print(H_n.shape)
-H_n = note_tracking(H_est)
-print(H_n.shape)
-print(H_n[:,100].shape)
-
-plt.figure()
-#plt.imshow(np.log(1+200*H_est[1::2]), aspect='auto', origin='lower')
-plt.imshow(H_n, aspect='auto', origin='lower')
-plt.colorbar()
-plt.title("Activation matrix H")
-plt.xlabel("Time frames")
-plt.ylabel("Pitch / Component index")
-plt.show()
-
-print(H_s.shape)
-
-print(note_template(0))
-
-v=[3,7,5,2,7,8,9,1,2,3,5,6,7,8,9,2,]
-def top_k_indices(v, k):
-    return np.argsort(v)[-k:][::-1]
-print(top_k_indices(v, 9))
-
 """# Оценка результатов транскрибирования"""
 
 pip install pretty_midi
@@ -1111,9 +1429,9 @@ for instrument in midi.instruments:
     for note in instrument.notes:
         pitches.add(note.pitch)
 
-print(len(sorted(pitches)))
-print(len(sorted(sp_max)))
-print(len(set(sp_max) & set(pitches)))
+#print(len(sorted(pitches)))
+#print(len(sorted(sp_max)))
+#print(len(set(sp_max) & set(pitches)))
 
 import numpy as np
 import pretty_midi
@@ -1226,23 +1544,3 @@ print(evaluate_results(trscrptn[:,:B.shape[1]],B))
 #print(evaluate_results(trscrptn,B[:,:trscrptn.shape[1]]))
 #print(trscrptn[:,B.shape[1]].shape)
 #print(B.shape)
-
-evaluate_results(H_f[:,:B.shape[1]],B)
-
-"""Оценка результатов подхода из статьи: https://www.researchgate.net/publication/320426354_Knowledge_based_Fundamental_and_Harmonic_Frequency_Detection_in_Polyphonic_Music_Analysis"""
-
-evaluate_results(Y[:,:B.shape[1]],B)
-
-print(TP)
-
-import matplotlib.pyplot as plt
-plt.figure()
-#plt.imshow(H_v, aspect='auto', origin='lower')
-plt.imshow(B[:,138:150], aspect='auto', origin='lower')
-plt.colorbar()
-plt.title("Activation matrix H")
-plt.xlabel("Time frames")
-plt.ylabel("Pitch / Component index")
-plt.show()
-
-print(B[:,139])
