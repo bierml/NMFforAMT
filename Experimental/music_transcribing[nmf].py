@@ -165,10 +165,28 @@ def build_W0(sr,
 
     return W0
 
-W_0 = build_W0(sr=f_s, bins_per_octave=12*K, n_bins=88 * K, fmin=librosa.note_to_hz('A0'))
-print(W_i)
+def build_noise_basis(n_bins, n_components=2):
+    Wn = np.zeros((n_bins, n_components))
 
-print(W_i.shape)
+    for i in range(n_components):
+        # random smooth noise shape
+        x = np.random.rand(n_bins)
+        x = np.convolve(x, np.hanning(15), mode='same')
+        x /= np.linalg.norm(x) + 1e-10
+        Wn[:, i] = x
+
+    return Wn
+
+W_0 = build_W0(sr=f_s, bins_per_octave=12*K, n_bins=88 * K, fmin=librosa.note_to_hz('A0'))
+#W_1 = build_W0(sr=f_s, bins_per_octave=12*K, n_bins=88 * K, fmin=librosa.note_to_hz('A0'),decay=0.8,sigma=2.0)
+#W_2 = build_W0(sr=f_s, bins_per_octave=12*K, n_bins=88 * K, fmin=librosa.note_to_hz('A0'),decay=0.2,sigma=1.2)
+Wn = build_noise_basis(88*K, 1)
+#Wn = np.ones((88*K, 1))
+#Wn /= np.linalg.norm(Wn)
+#W_0 = interleave_cols(W_1,W_2)
+W_0 = np.concatenate([W_0, Wn], axis=1)
+
+print(W_0.shape)
 import matplotlib.pyplot as plt
 plt.figure()
 #plt.imshow(H_v, aspect='auto', origin='lower')
@@ -182,11 +200,11 @@ plt.xlabel("Time frames")
 plt.ylabel("Pitch / Component index")
 plt.show()
 
-H_0 = np.random.rand(88, spectrogram_norm.shape[1])
+H_0 = np.random.rand(88+1, spectrogram_norm.shape[1])
 #nmf = nimfa.Nmf(spectrogram_compressed, seed='fixed', W=W_temp)
 nmf = nimfa.Nmf(
     spectrogram_norm,
-    rank=K,
+    rank=88+1,
     seed='fixed',
     W=W_0,
     H=H_0,
@@ -243,8 +261,12 @@ def rowwise_norm(H, eps=1e-8):
         if m > eps:
             Hn[q] /= m
     return Hn
-#Y = norm_dynamic_range(H_new)
+H_est = H_est[0:88,:]
+#print(H_est.shape)
+#Y = sum_row_pairs(H_est)
+#print(Y.shape)
 Y = rowwise_norm(H_est)
+#Y = norm_dynamic_range(H_new)
 Y = matrix_filter(Y)
 #Y = unsharp_matrix(Y)
 #Y = np.maximum(0, Y)
@@ -310,7 +332,7 @@ def top_k_indices(v, k):
 def pitch_harmonics(p):
   r = [p+12,p+19,p+24,p+28,p+31,p+34,p+36]
   return [m for m in r if m <= 87]
-def transcribe_frame(fr,thr=0.18):
+def transcribe_frame(fr,thr=0.12):
   frn = fr.copy()
   peaks = [int(p) for p in top_k_indices(fr,20)]
   #peaks = [int(p) for p in range(88) if fr[p] > 0.25]
@@ -409,6 +431,14 @@ def pitch_energy(fp,p):
   #print(en)
   return float(en/en_t)
   #return en[0,0]
+def clear_H(H,W_e,t=2.7):
+  H_r = H.copy()
+  print(H_r.shape)
+  for i in range(88):
+    s = W_e[i*3,i] + W_e[i*3+1,i] + W_e[i*3+2,i]
+    if(s<t):
+      H_r[i,:] = 0
+  return H_r
 #print(transcribe_frame(H_m[:,1]))
 print(transcribe_onset(Y[:,479:489]))
 #print(transcribe_frame(Y[:,152]))
@@ -417,6 +447,7 @@ print(transcribe_onset(Y[:,479:489]))
 trscrptn = transcribe_H(Y,onsets)
 trscrptn[0,:] = 0
 trscrptn = enforce_min_duration(trscrptn,min_len=10)
+trscrptn = clear_H(trscrptn,W_est)
 import matplotlib.pyplot as plt
 plt.figure()
 #plt.imshow(H_v, aspect='auto', origin='lower')
