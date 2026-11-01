@@ -2031,17 +2031,78 @@ def read_wav_as_float(file_path):
 
     return sr, np.ascontiguousarray(x)
 
+def midi_to_cqt_labels(
+    midi_input,
+    n_frames,
+    sr,
+    hop_length,
+    pitch_range=(21, 108)
+):
+    """
+    Generate MIDI ground-truth labels at CQT frame centers.
+
+    Returns
+    -------
+    B : ndarray, shape (n_pitches, n_frames)
+        Binary piano roll.
+    """
+
+    if isinstance(midi_input, str):
+        midi = pretty_midi.PrettyMIDI(midi_input)
+    else:
+        midi = midi_input
+
+    dt = hop_length / sr
+
+    # CQT frame center timestamps
+    times = np.arange(n_frames) * dt
+
+    pitches = np.arange(
+        pitch_range[0],
+        pitch_range[1] + 1
+    )
+
+    B = np.zeros(
+        (len(pitches), n_frames),
+        dtype=np.uint8
+    )
+
+    for instrument in midi.instruments:
+
+        for note in instrument.notes:
+
+            if note.pitch not in pitches:
+                continue
+
+            pitch_idx = note.pitch - pitch_range[0]
+
+            active = (
+                (times >= note.start) &
+                (times < note.end)
+            )
+
+            B[pitch_idx, active] = 1
+
+    return B
+
+M = midi_to_cqt_labels("/content/Prelude-in-E-Minor-Nr-4.mid", 2781, 22050,2048)
+import matplotlib.pyplot as plt
+
+plt.imshow(M, aspect='auto', origin='lower')
+#for idx in onsets:
+#    plt.axvline(x=idx, color='red', linewidth=0.8, alpha=0.8)
+plt.colorbar()
+plt.title("Activation matrix H")
+plt.xlabel("Time frames")
+plt.ylabel("Pitch / Component index")
+plt.show()
+
 def list_spectrograms():
   l = get_files("wav")
   r = get_files("mid")
   for m in l.copy():
-    #print(m[:-3]+"mid")
     if(not m[:-3]+"mid" in r):
       l.remove(m)
-      #print("removed:", m)
-  #print(l)
-  #print(r)
-  #s = []
   trainers = [BinaryGaussianHMMTrainer() for _ in range(88)]
   for file_name_string_audio in l:
     f_s, x = read_wav_as_float(file_name_string_audio)
@@ -2062,20 +2123,237 @@ def list_spectrograms():
         tol=1e-5,
         random_state=42,
     )
-    dt = HOP / f_s
+    '''dt = HOP / f_s
     B, times = midi_to_binary_matrix(
         file_name_string_audio[:-3]+"mid",
         dt=dt
+    )'''
+    B = midi_to_cqt_labels(
+      file_name_string_audio[:-3]+"mid",
+      n_frames=H.shape[1],
+      sr=f_s,
+      hop_length=HOP
     )
-    print(file_name_string_audio)
+    print(H.shape[1],B.shape[1])
+    #print(file_name_string_audio)
     #s.append((H[:88,:B.shape[1]],B))
     #for i in range(len(H_files)):
+    '''s = min(B.shape[1],H.shape[1])
+    print(H.shape)
+    print("shapes:",H[:88,:s].T.shape, B[:,:s].shape)
     for pitch in range(88):
-      trainers[pitch].update(H[:,:B.shape[1]].T,B[pitch, :])
+      trainers[pitch].update(H[:88,:B.shape[1]].T,B[pitch, :s])'''
+    for pitch in range(88):
+      trainers[pitch].update(H[pitch-1:pitch+2,:].T,B[pitch, :])
     del x, W_0, Wn, spectrogram
     del W, H, history
-    #  print(f"Processed recording {i + 1}")
-    #print(s[0][0].shape,s[0][1].shape)
-  return s
+  return trainers
 
-list_spectrograms()
+res = list_spectrograms()
+
+res[29].get_model()
+
+models = [
+    res[i].get_model()
+    for i in range(20,len(res)-8)
+]
+
+import matplotlib.pyplot as plt
+plt.figure()
+plt.imshow(H, aspect='auto', origin='lower')
+'''for idx in onsets:
+    plt.axvline(x=idx, color='red', linewidth=0.8, alpha=0.8)'''
+plt.colorbar()
+plt.title("Activation matrix W")
+plt.xlabel("Time frames")
+plt.ylabel("Pitch / Component index")
+plt.show()
+
+print(np.sum(W[:,46]))
+
+X = np.zeros((88,H.shape[1]))
+print(X.shape)
+print(H.shape)
+
+pitch_indices = range(20, len(res)-8)
+
+models = [
+    res[i].get_model()
+    for i in pitch_indices
+]
+
+X_obs = H[:88, :].T
+
+piano_roll = np.zeros(
+    (88, H.shape[1]),
+    dtype=np.uint8
+)
+
+for pitch in pitch_indices:
+
+    model_idx = pitch - 20
+
+    # Five neighboring pitch activations
+    X_pitch = X_obs[:, pitch-2:pitch+3]
+
+    piano_roll[pitch, :] = models[model_idx].predict(X_pitch)
+
+def clear_piano_roll(W, H):
+
+print(W[196,39])
+
+import matplotlib.pyplot as plt
+plt.figure()
+plt.imshow(piano_roll, aspect='auto', origin='lower')
+'''for idx in onsets:
+    plt.axvline(x=idx, color='red', linewidth=0.8, alpha=0.8)'''
+plt.colorbar()
+plt.title("Activation matrix W")
+plt.xlabel("Time frames")
+plt.ylabel("Pitch / Component index")
+plt.show()
+
+import matplotlib.pyplot as plt
+plt.figure()
+plt.imshow(W, aspect='auto', origin='lower')
+plt.colorbar()
+plt.title("Activation matrix W")
+plt.xlabel("Time frames")
+plt.ylabel("Pitch / Component index")
+plt.show()
+
+for pitch in [20, 39, 60, 80]:
+    model = res[pitch].get_model()
+
+    print(f"\nPitch index: {pitch}")
+    print("Means:\n", model.means_)
+    print("Variances:\n", model.covars_)
+    print("Transitions:\n", model.transmat_)
+
+pitch = 39
+
+model = res[pitch].get_model()
+
+print("State transition matrix:")
+print(model.transmat_)
+
+print("\nInitial probabilities:")
+print(model.startprob_)
+
+print("\nMean activation vectors:")
+print(model.means_)
+
+print("Pitch activation when inactive:",
+      model.means_[0, pitch])
+
+print("Pitch activation when active:",
+      model.means_[1, pitch])
+
+import matplotlib.pyplot as plt
+
+pitch = 39
+
+X_test = H[pitch-2:pitch+3, :].T
+
+y_pred = model.predict(X_test)
+
+fig, axes = plt.subplots(
+    3, 1,
+    figsize=(16, 7),
+    sharex=True
+)
+
+axes[0].plot(B[pitch, :len(y_pred)])
+axes[0].set_title("Ground truth")
+
+axes[1].plot(H[pitch, :len(y_pred)])
+axes[1].set_title("HNMA activation")
+
+axes[2].plot(y_pred)
+axes[2].set_title("HMM prediction")
+
+plt.tight_layout()
+plt.show()
+
+from sklearn.preprocessing import StandardScaler
+
+scaler = StandardScaler()
+
+# During training:
+X_train = scaler.fit_transform(H)
+
+# During inference:
+X_test = scaler.transform(H)
+
+import matplotlib.pyplot as plt
+plt.figure()
+plt.imshow(X_test, aspect='auto', origin='lower')
+plt.colorbar()
+plt.title("Activation matrix W")
+plt.xlabel("Time frames")
+plt.ylabel("Pitch / Component index")
+plt.show()
+
+def estimate_alignment_lag(
+    activation,
+    labels,
+    max_lag=30
+):
+    activation = np.asarray(activation, dtype=float)
+    labels = np.asarray(labels, dtype=float)
+
+    n = min(len(activation), len(labels))
+
+    activation = activation[:n]
+    labels = labels[:n]
+
+    # Normalize
+    activation = (
+        activation - activation.mean()
+    ) / (activation.std() + 1e-10)
+
+    labels = (
+        labels - labels.mean()
+    ) / (labels.std() + 1e-10)
+
+    lags = np.arange(-max_lag, max_lag + 1)
+    correlations = []
+
+    for lag in lags:
+
+        if lag > 0:
+            a = activation[lag:]
+            b = labels[:-lag]
+
+        elif lag < 0:
+            a = activation[:lag]
+            b = labels[-lag:]
+
+        else:
+            a = activation
+            b = labels
+
+        correlations.append(
+            np.mean(a * b)
+        )
+
+    best_idx = np.argmax(correlations)
+
+    return lags[best_idx], correlations[best_idx]
+
+pitch = 39
+
+lag, corr = estimate_alignment_lag(
+    H[pitch],
+    B[pitch],
+    max_lag=30
+)
+
+print("Estimated lag:", lag, "frames")
+print("Correlation:", corr)
+
+print(
+    "Estimated time offset:",
+    lag * HOP / 22050,
+    "seconds"
+)
