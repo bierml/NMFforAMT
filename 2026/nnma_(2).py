@@ -1970,16 +1970,6 @@ class BinaryGaussianHMMTrainer:
 
         return model
 
-print(y_pred)
-
-import matplotlib.pyplot as plt
-
-plt.plot(y_pred)
-plt.xlabel("Index")
-plt.ylabel("Value")
-plt.grid()
-plt.show()
-
 from pathlib import Path
 def get_files(extension):
     return [str(file) for file in Path.cwd().rglob("*."+extension)]
@@ -2077,6 +2067,91 @@ plt.xlabel("Time frames")
 plt.ylabel("Pitch / Component index")
 plt.show()
 
+from pathlib import Path
+def get_files(extension):
+    return [str(file) for file in Path.cwd().rglob("*."+extension)]
+l = get_files("")
+print(l)
+
+import soundfile as sf
+import numpy as np
+
+def read_wav_as_float(file_path):
+
+    # Read audio directly as float32
+    x, sr = sf.read(
+        file_path,
+        dtype="float32",
+        always_2d=True
+    )
+
+    n_frames, n_channels = x.shape
+
+    print(
+        f"Channels: {n_channels}, "
+        f"Sample Rate: {sr}, "
+        f"Frames: {n_frames}"
+    )
+
+    # Convert stereo/multichannel audio to mono
+    x = np.mean(x, axis=1, dtype=np.float32)
+
+    return sr, np.ascontiguousarray(x)
+
+def midi_to_cqt_labels(
+    midi_input,
+    n_frames,
+    sr,
+    hop_length,
+    pitch_range=(21, 108)
+):
+    """
+    Generate MIDI ground-truth labels at CQT frame centers.
+
+    Returns
+    -------
+    B : ndarray, shape (n_pitches, n_frames)
+        Binary piano roll.
+    """
+
+    if isinstance(midi_input, str):
+        midi = pretty_midi.PrettyMIDI(midi_input)
+    else:
+        midi = midi_input
+
+    dt = hop_length / sr
+
+    # CQT frame center timestamps
+    times = np.arange(n_frames) * dt
+
+    pitches = np.arange(
+        pitch_range[0],
+        pitch_range[1] + 1
+    )
+
+    B = np.zeros(
+        (len(pitches), n_frames),
+        dtype=np.uint8
+    )
+
+    for instrument in midi.instruments:
+
+        for note in instrument.notes:
+
+            if note.pitch not in pitches:
+                continue
+
+            pitch_idx = note.pitch - pitch_range[0]
+
+            active = (
+                (times >= note.start) &
+                (times < note.end)
+            )
+
+            B[pitch_idx, active] = 1
+
+    return B
+
 def list_spectrograms():
   l = get_files("wav")
   r = get_files("mid")
@@ -2125,19 +2200,11 @@ def list_spectrograms():
     for pitch in range(88):
       trainers[pitch].update(H[:88,:B.shape[1]].T,B[pitch, :s])'''
     for pitch in range(88):
-      trainers[pitch].update(H[pitch-1:pitch+2,:].T,B[pitch, :])
+      #trainers[pitch].update(H[pitch-1:pitch+2,:].T,B[pitch, :])
+      trainers[pitch].update(B[pitch, :])
     del x, W_0, Wn, spectrogram
     del W, H, history
   return trainers
-
-res = list_spectrograms()
-
-res[29].get_model()
-
-models = [
-    res[i].get_model()
-    for i in range(20,len(res)-8)
-]
 
 import matplotlib.pyplot as plt
 plt.figure()
@@ -2156,41 +2223,274 @@ X = np.zeros((88,H.shape[1]))
 print(X.shape)
 print(H.shape)
 
-H_u = norm_log(H * 100, g)
-H_u = librosa.util.normalize(H, norm = 2, axis = 0, threshold = 0.05)
-#H_u = librosa.decompose.hpss(H_u)[0]
-pitch_indices = range(20, len(res)-8)
+import numpy as np
+
+
+class BinaryGaussianHMMTrainer:
+    """
+    Despite the retained class name, this is now a two-state
+    discrete Markov model, not a Gaussian HMM.
+
+    State 0: pitch inactive
+    State 1: pitch active
+
+    Only MIDI state sequences are used for training.
+    """
+
+    def __init__(self, smoothing=1.0):
+
+        self.smoothing = float(smoothing)
+
+        if self.smoothing <= 0:
+            raise ValueError("smoothing must be positive.")
+
+        # Counts for initial states.
+        self.start_counts = np.zeros(2, dtype=np.float64)
+
+        # Transition counts:
+        # transition_counts[previous_state, current_state]
+        self.transition_counts = np.zeros((2, 2), dtype=np.float64)
+
+        self.n_sequences = 0
+
+    def update(self, y):
+
+        y = np.asarray(y).reshape(-1)
+
+        if len(y) == 0:
+            return
+
+        if not np.all(np.isin(y, [0, 1])):
+            raise ValueError("Labels must contain only 0 and 1.")
+
+        y = y.astype(np.int64)
+
+        # Estimate initial-state probabilities.
+        self.start_counts[y[0]] += 1
+
+        # Estimate transition probabilities.
+        for previous_state, current_state in zip(y[:-1], y[1:]):
+            self.transition_counts[previous_state, current_state] += 1
+
+        self.n_sequences += 1
+
+    def get_model(self):
+
+        if self.n_sequences == 0:
+            raise RuntimeError("Cannot obtain a model without training data.")
+
+        alpha = self.smoothing
+
+        # Initial-state probabilities.
+        startprob = (
+            self.start_counts + alpha
+        ) / (
+            self.start_counts.sum() + 2 * alpha
+        )
+
+        # Transition probabilities.
+        transmat = self.transition_counts + alpha
+
+        transmat /= transmat.sum(axis=1, keepdims=True)
+
+        return {
+            "startprob": startprob,
+            "transmat": transmat
+        }
+def viterbi_binary_hmm(
+    P,
+    model,
+    score_scale=1.0,
+    score_offset=0.0,
+    input_is_probability=False
+):
+    """
+    Viterbi decoding for a two-state Markov model.
+
+    Parameters
+    ----------
+    P : array, shape (n_frames,)
+        Continuous transcription scores for one pitch.
+
+    model : dict
+        Contains:
+            startprob: shape (2,)
+            transmat: shape (2, 2)
+
+    score_scale : float
+        Multiplier inside the sigmoid.
+
+    score_offset : float
+        Offset subtracted from P before applying sigmoid.
+
+    input_is_probability : bool
+        If True, P is already a probability sequence and is not
+        passed through sigmoid.
+
+    Returns
+    -------
+    states : array, shape (n_frames,)
+        Binary sequence: 0 = inactive, 1 = active.
+    """
+
+    P = np.asarray(P, dtype=np.float64).reshape(-1)
+
+    n_frames = len(P)
+
+    if n_frames == 0:
+        return np.empty(0, dtype=np.uint8)
+
+    if not np.all(np.isfinite(P)):
+        raise ValueError("P contains NaN or infinite values.")
+
+    eps = 1e-12
+
+    startprob = np.asarray(model["startprob"], dtype=np.float64)
+    transmat = np.asarray(model["transmat"], dtype=np.float64)
+
+    if startprob.shape != (2,) or transmat.shape != (2, 2):
+        raise ValueError("Invalid model dimensions.")
+
+    # --------------------------------------------------
+    # Observation probabilities
+    # --------------------------------------------------
+
+    if input_is_probability:
+
+        s = np.clip(P, eps, 1.0 - eps)
+
+        log_e1 = np.log(s)
+        log_e0 = np.log1p(-s)
+
+    else:
+
+        # Stable calculation of:
+        # log(sigmoid(z)) and log(1 - sigmoid(z)).
+        z = score_scale * (P - score_offset)
+
+        log_e1 = -np.logaddexp(0.0, -z)
+        log_e0 = -np.logaddexp(0.0, z)
+
+    # Shape: (2, n_frames)
+    log_emission = np.vstack([log_e0, log_e1])
+
+    # --------------------------------------------------
+    # Log probabilities
+    # --------------------------------------------------
+
+    log_start = np.log(np.maximum(startprob, eps))
+    log_trans = np.log(np.maximum(transmat, eps))
+
+    # --------------------------------------------------
+    # Viterbi forward pass
+    # --------------------------------------------------
+
+    delta = np.zeros((2, n_frames), dtype=np.float64)
+
+    # Backtracking pointers.
+    backpointer = np.zeros((2, n_frames), dtype=np.int8)
+
+    delta[:, 0] = log_start + log_emission[:, 0]
+
+    for t in range(1, n_frames):
+
+        # scores[previous_state, current_state]
+        scores = delta[:, t - 1, None] + log_trans
+
+        backpointer[:, t] = np.argmax(scores, axis=0)
+
+        delta[:, t] = (
+            np.max(scores, axis=0) + log_emission[:, t]
+        )
+
+    # --------------------------------------------------
+    # Backtracking
+    # --------------------------------------------------
+
+    states = np.zeros(n_frames, dtype=np.uint8)
+
+    states[-1] = np.argmax(delta[:, -1])
+
+    for t in range(n_frames - 1, 0, -1):
+
+        states[t - 1] = backpointer[states[t], t]
+
+    return states
+def hmm_postprocess(
+    P,
+    models,
+    score_scale=1.0,
+    score_offset=0.0,
+    input_is_probability=False
+):
+    """
+    Apply independent two-state HMM postprocessing to a piano roll.
+
+    Parameters
+    ----------
+    P : array, shape (88, n_frames)
+        Continuous piano-roll scores.
+
+    models : list
+        88 trained Markov models.
+
+    Returns
+    -------
+    piano_roll : array, shape (88, n_frames)
+        Binary piano roll.
+    """
+
+    P = np.asarray(P, dtype=np.float64)
+
+    if P.ndim != 2 or P.shape[0] != 88:
+        raise ValueError(f"Expected P shape (88, T), got {P.shape}")
+
+    if len(models) != 88:
+        raise ValueError("Exactly 88 HMM models are required.")
+
+    piano_roll = np.zeros(P.shape, dtype=np.uint8)
+
+    for pitch in range(88):
+
+        piano_roll[pitch, :] = viterbi_binary_hmm(
+            P[pitch, :],
+            models[pitch],
+            score_scale=score_scale,
+            score_offset=score_offset,
+            input_is_probability=input_is_probability
+        )
+
+    return piano_roll
+
+trainers = list_spectrograms()
 
 models = [
-    res[i].get_model()
-    for i in pitch_indices
+    trainer.get_model()
+    for trainer in trainers
 ]
+# H has shape (89, n_frames).
+# The first 88 rows correspond to piano pitches.
+P = H[:88, :]
 
-X_obs = H_u[:88, :].T
-
-piano_roll = np.zeros(
-    (88, H_u.shape[1]),
-    dtype=np.uint8
+piano_roll = hmm_postprocess(
+    P,
+    models,
+    score_scale=1.0,
+    score_offset=0.0
 )
 
-for pitch in pitch_indices:
+P = H5[:88, :]
 
-    model_idx = pitch - 20
-
-    # Five neighboring pitch activations
-    X_pitch = X_obs[:, pitch-1:pitch+2]
-
-    piano_roll[pitch, :] = models[model_idx].predict(X_pitch)
-
-def clear_piano_roll(W, H):
-
-print(W[196,39])
+piano_roll = hmm_postprocess(
+    P,
+    models,
+    score_scale=1.0,
+    score_offset=0.0
+)
 
 import matplotlib.pyplot as plt
 plt.figure()
 plt.imshow(piano_roll, aspect='auto', origin='lower')
-'''for idx in onsets:
-    plt.axvline(x=idx, color='red', linewidth=0.8, alpha=0.8)'''
 plt.colorbar()
 plt.title("Activation matrix W")
 plt.xlabel("Time frames")
@@ -2199,147 +2499,535 @@ plt.show()
 
 print(evaluate_results(piano_roll[:,:B.shape[1]],B))
 
-import matplotlib.pyplot as plt
-plt.figure()
-plt.imshow(W, aspect='auto', origin='lower')
-plt.colorbar()
-plt.title("Activation matrix W")
-plt.xlabel("Time frames")
-plt.ylabel("Pitch / Component index")
-plt.show()
+import numpy as np
+import tensorflow as tf
 
-for pitch in [20, 39, 60, 80]:
-    model = res[pitch].get_model()
 
-    print(f"\nPitch index: {pitch}")
-    print("Means:\n", model.means_)
-    print("Variances:\n", model.covars_)
-    print("Transitions:\n", model.transmat_)
-
-pitch = 39
-
-model = res[pitch].get_model()
-
-print("State transition matrix:")
-print(model.transmat_)
-
-print("\nInitial probabilities:")
-print(model.startprob_)
-
-print("\nMean activation vectors:")
-print(model.means_)
-
-print("Pitch activation when inactive:",
-      model.means_[0, pitch])
-
-print("Pitch activation when active:",
-      model.means_[1, pitch])
-
-import matplotlib.pyplot as plt
-
-pitch = 39
-
-X_test = H[pitch-2:pitch+3, :].T
-
-y_pred = model.predict(X_test)
-
-fig, axes = plt.subplots(
-    3, 1,
-    figsize=(16, 7),
-    sharex=True
-)
-
-axes[0].plot(B[pitch, :len(y_pred)])
-axes[0].set_title("Ground truth")
-
-axes[1].plot(H[pitch, :len(y_pred)])
-axes[1].set_title("HNMA activation")
-
-axes[2].plot(y_pred)
-axes[2].set_title("HMM prediction")
-
-plt.tight_layout()
-plt.show()
-
-from sklearn.preprocessing import StandardScaler
-
-scaler = StandardScaler()
-
-# During training:
-X_train = scaler.fit_transform(H)
-
-# During inference:
-X_test = scaler.transform(H)
-
-import matplotlib.pyplot as plt
-plt.figure()
-plt.imshow(X_test, aspect='auto', origin='lower')
-plt.colorbar()
-plt.title("Activation matrix W")
-plt.xlabel("Time frames")
-plt.ylabel("Pitch / Component index")
-plt.show()
-
-def estimate_alignment_lag(
-    activation,
-    labels,
-    max_lag=30
+def build_convnet(
+    K=5,
+    context_frames=5,
+    n_pitches=88,
+    target_mode="binary",
+    learning_rate=1e-3
 ):
-    activation = np.asarray(activation, dtype=float)
-    labels = np.asarray(labels, dtype=float)
+    """
+    Build the CNN for automatic music transcription.
 
-    n = min(len(activation), len(labels))
+    Parameters
+    ----------
+    K : int
+        Number of frequency bins per MIDI pitch.
+        Input frequency dimension = 88 * K.
 
-    activation = activation[:n]
-    labels = labels[:n]
+        For K=5, input shape is (5, 440, 1).
 
-    # Normalize
-    activation = (
-        activation - activation.mean()
-    ) / (activation.std() + 1e-10)
+    context_frames : int
+        Number of consecutive spectrogram frames.
 
-    labels = (
-        labels - labels.mean()
-    ) / (labels.std() + 1e-10)
+    n_pitches : int
+        Number of output pitches. Default: 88.
 
-    lags = np.arange(-max_lag, max_lag + 1)
-    correlations = []
+    target_mode : str
+        "binary"     - binary piano-roll targets, BCE loss.
+        "continuous" - continuous targets in [0, 1], MSE loss.
 
-    for lag in lags:
+    learning_rate : float
+        Adam learning rate.
 
-        if lag > 0:
-            a = activation[lag:]
-            b = labels[:-lag]
+    Returns
+    -------
+    model : tf.keras.Model
+    """
 
-        elif lag < 0:
-            a = activation[:lag]
-            b = labels[-lag:]
+    n_bins = n_pitches * K
 
-        else:
-            a = activation
-            b = labels
+    inputs = tf.keras.Input(
+        shape=(context_frames, n_bins, 1),
+        name="spectrogram_input"
+    )
 
-        correlations.append(
-            np.mean(a * b)
+    # First convolutional block
+    x = tf.keras.layers.Conv2D(
+        filters=32,
+        kernel_size=(3, 3),
+        padding="same",
+        activation="relu",
+        name="conv1"
+    )(inputs)
+
+    x = tf.keras.layers.Conv2D(
+        filters=32,
+        kernel_size=(3, 3),
+        padding="same",
+        activation="relu",
+        name="conv2"
+    )(x)
+
+    x = tf.keras.layers.BatchNormalization(
+        name="batch_norm"
+    )(x)
+
+    x = tf.keras.layers.MaxPooling2D(
+        pool_size=(1, 2),
+        name="max_pool1"
+    )(x)
+
+    x = tf.keras.layers.Dropout(
+        0.25,
+        name="dropout1"
+    )(x)
+
+    # Second convolutional block
+    x = tf.keras.layers.Conv2D(
+        filters=64,
+        kernel_size=(3, 3),
+        padding="same",
+        activation="relu",
+        name="conv3"
+    )(x)
+
+    x = tf.keras.layers.MaxPooling2D(
+        pool_size=(1, 2),
+        name="max_pool2"
+    )(x)
+
+    x = tf.keras.layers.Dropout(
+        0.25,
+        name="dropout2"
+    )(x)
+
+    # Fully connected layers
+    x = tf.keras.layers.Flatten(name="flatten")(x)
+
+    x = tf.keras.layers.Dense(
+        512,
+        activation="relu",
+        name="dense512"
+    )(x)
+
+    x = tf.keras.layers.Dropout(
+        0.5,
+        name="dropout3"
+    )(x)
+
+    # Output: probability or normalized activation for each pitch
+    outputs = tf.keras.layers.Dense(
+        n_pitches,
+        activation="sigmoid",
+        name="pitch_output"
+    )(x)
+
+    model = tf.keras.Model(
+        inputs=inputs,
+        outputs=outputs,
+        name="ConvNet_AMT"
+    )
+
+    # Compile
+    if target_mode == "binary":
+
+        loss = tf.keras.losses.BinaryCrossentropy()
+
+        metrics = [
+            tf.keras.metrics.BinaryAccuracy(
+                name="binary_accuracy"
+            ),
+            tf.keras.metrics.Precision(name="precision"),
+            tf.keras.metrics.Recall(name="recall"),
+            tf.keras.metrics.AUC(
+                curve="PR",
+                multi_label=True,
+                num_labels=n_pitches,
+                name="pr_auc"
+            )
+        ]
+
+    elif target_mode == "continuous":
+
+        loss = tf.keras.losses.MeanSquaredError()
+
+        metrics = [
+            tf.keras.metrics.MeanAbsoluteError(name="mae"),
+            tf.keras.metrics.MeanSquaredError(name="mse")
+        ]
+
+    else:
+        raise ValueError(
+            "target_mode must be 'binary' or 'continuous'"
         )
 
-    best_idx = np.argmax(correlations)
+    model.compile(
+        optimizer=tf.keras.optimizers.Adam(
+            learning_rate=learning_rate
+        ),
+        loss=loss,
+        metrics=metrics
+    )
 
-    return lags[best_idx], correlations[best_idx]
+    return model
+def train_convnet(
+    model,
+    X_train,
+    y_train,
+    X_val,
+    y_val,
+    batch_size=128,
+    epochs=100,
+    checkpoint_path="best_convnet.keras",
+    output_path="convnet.keras",
+    target_mode="binary"
+):
+    """
+    Train the CNN and save the best model.
 
-pitch = 39
+    Returns
+    -------
+    history : tf.keras.callbacks.History
+    """
 
-lag, corr = estimate_alignment_lag(
-    H[pitch],
-    B[pitch],
-    max_lag=30
+    def prepare_X(X):
+
+        X = np.asarray(X, dtype=np.float32)
+
+        if X.ndim == 3:
+            X = X[..., np.newaxis]
+
+        expected_shape = tuple(model.input_shape[1:])
+
+        if X.shape[1:] != expected_shape:
+            raise ValueError(
+                f"Expected input shape {expected_shape}, "
+                f"received {X.shape[1:]}"
+            )
+
+        if not np.all(np.isfinite(X)):
+            raise ValueError("Input contains NaN or infinity.")
+
+        return X
+
+    def prepare_y(y):
+
+        y = np.asarray(y, dtype=np.float32)
+
+        if y.ndim != 2:
+            raise ValueError(
+                "Targets must have shape (n_samples, n_pitches)."
+            )
+
+        if y.shape[1] != model.output_shape[-1]:
+            raise ValueError("Incorrect number of target pitches.")
+
+        if not np.all(np.isfinite(y)):
+            raise ValueError("Targets contain NaN or infinity.")
+
+        return y
+
+    X_train = prepare_X(X_train)
+    X_val = prepare_X(X_val)
+
+    y_train = prepare_y(y_train)
+    y_val = prepare_y(y_val)
+
+    if len(X_train) != len(y_train):
+        raise ValueError("Training input/target counts do not match.")
+
+    if len(X_val) != len(y_val):
+        raise ValueError("Validation input/target counts do not match.")
+
+    if target_mode == "binary":
+        monitor = "val_pr_auc"
+        mode = "max"
+    else:
+        monitor = "val_loss"
+        mode = "min"
+
+    callbacks = [
+
+        tf.keras.callbacks.ModelCheckpoint(
+            filepath=checkpoint_path,
+            monitor=monitor,
+            mode=mode,
+            save_best_only=True,
+            verbose=1
+        ),
+
+        tf.keras.callbacks.EarlyStopping(
+            monitor=monitor,
+            mode=mode,
+            patience=15,
+            restore_best_weights=True,
+            verbose=1
+        ),
+
+        tf.keras.callbacks.ReduceLROnPlateau(
+            monitor="val_loss",
+            mode="min",
+            factor=0.5,
+            patience=5,
+            min_lr=1e-6,
+            verbose=1
+        )
+    ]
+
+    history = model.fit(
+        X_train,
+        y_train,
+        validation_data=(X_val, y_val),
+        batch_size=batch_size,
+        epochs=epochs,
+        shuffle=True,
+        callbacks=callbacks,
+        verbose=1
+    )
+
+    model.save(output_path)
+
+    return history
+def make_context_dataset(
+    spectrogram,
+    piano_roll,
+    context_frames=5
+):
+    """
+    Generate CNN training examples from one recording.
+
+    Parameters
+    ----------
+    spectrogram : ndarray, shape (n_frames, n_bins)
+        Time-major spectrogram.
+
+    piano_roll : ndarray, shape (n_frames, 88)
+        Ground-truth piano roll aligned with the spectrogram.
+
+    context_frames : int
+        Number of neighboring frames used as input.
+        Should normally be odd.
+
+    Returns
+    -------
+    X : ndarray, shape (n_frames, context_frames, n_bins)
+    y : ndarray, shape (n_frames, 88)
+    """
+
+    spectrogram = np.asarray(
+        spectrogram,
+        dtype=np.float32
+    )
+
+    piano_roll = np.asarray(
+        piano_roll,
+        dtype=np.float32
+    )
+
+    if spectrogram.ndim != 2:
+        raise ValueError(
+            "spectrogram must have shape (n_frames, n_bins)"
+        )
+
+    if piano_roll.ndim != 2:
+        raise ValueError(
+            "piano_roll must have shape (n_frames, n_pitches)"
+        )
+
+    if spectrogram.shape[0] != piano_roll.shape[0]:
+        raise ValueError(
+            "Spectrogram and piano roll must have the same "
+            "number of frames."
+        )
+
+    if context_frames < 1 or context_frames % 2 == 0:
+        raise ValueError(
+            "context_frames must be a positive odd number."
+        )
+
+    n_frames = spectrogram.shape[0]
+
+    left = context_frames // 2
+    right = context_frames - 1 - left
+
+    # Replicate boundary frames to preserve the number of samples.
+    padded = np.pad(
+        spectrogram,
+        ((left, right), (0, 0)),
+        mode="edge"
+    )
+
+    # Construct sliding context windows.
+    X = np.stack(
+        [
+            padded[i:i + n_frames]
+            for i in range(context_frames)
+        ],
+        axis=1
+    )
+
+    return X, piano_roll
+def tracks_to_dataset(
+    tracks,
+    context_frames=5
+):
+    """
+    Convert multiple tracks into a single training dataset.
+
+    Parameters
+    ----------
+    tracks : list of tuples
+        Each tuple contains:
+            (spectrogram, piano_roll)
+
+        Both must be time-major.
+
+    Returns
+    -------
+    X : (total_frames, context_frames, n_bins)
+    y : (total_frames, 88)
+    """
+
+    X_list = []
+    y_list = []
+
+    for spectrogram, piano_roll in tracks:
+
+        X, y = make_context_dataset(
+            spectrogram,
+            piano_roll,
+            context_frames=context_frames
+        )
+
+        X_list.append(X)
+        y_list.append(y)
+
+    if not X_list:
+        raise ValueError("No training tracks supplied.")
+
+    return (
+        np.concatenate(X_list, axis=0),
+        np.concatenate(y_list, axis=0)
+    )
+def extract_binary_data():
+  l = get_files("wav")
+  r = get_files("mid")
+  for m in l.copy():
+    if(not m[:-3]+"mid" in r):
+      l.remove(m)
+  data = []
+  for file_name_string_audio in l:
+    f_s, x = read_wav_as_float(file_name_string_audio)
+    W_0 = build_W0(sr=f_s, bins_per_octave=12*K, n_bins=88 * K+L, fmin=librosa.note_to_hz('A0'), sigma=1.75)
+    Wn = build_noise_basis(88*K+L, 1)
+    W_0 = np.concatenate([W_0, Wn], axis=1)
+    spectrogram = np.abs(librosa.cqt(x,sr=f_s, fmin=librosa.note_to_hz('A0'), bins_per_octave=12 * K, n_bins=88 * K+L, hop_length=HOP, sparsity=0.05))
+    spectrogram = norm_log(spectrogram, g)
+    spectrogram = librosa.util.normalize(spectrogram, norm = 2, axis = 0, threshold = 0.05)
+    W, H, history = hnma(
+        spectrogram,
+        W_init=W_0,
+        n_components=88+1,
+        lambda_alpha=1e-3,
+        bins_per_octave=12*K,
+        max_iter=500,
+        tol=1e-5,
+        random_state=42,
+    )
+    B = midi_to_cqt_labels(
+      file_name_string_audio[:-3]+"mid",
+      n_frames=H.shape[1],
+      sr=f_s,
+      hop_length=HOP
+    )
+    print(H.shape[1],B.shape[1])
+    data.append((H[0:88,:],B))
+    del x, W_0, Wn, spectrogram
+    del W, H, B, history
+  return data
+
+import random
+model = build_convnet(
+    K=1,
+    context_frames=5,
+    n_pitches=88,
+    target_mode="binary",
+    learning_rate=1e-3
 )
 
-print("Estimated lag:", lag, "frames")
-print("Correlation:", corr)
+model.summary()
+data = extract_binary_data()
+random.shuffle(data)
 
-print(
-    "Estimated time offset:",
-    lag * HOP / 22050,
-    "seconds"
+train_tracks = [(l[0].T,l[1].T) for l in data[0:(len(data)*3)//8]]
+val_tracks = [(l[0].T,l[1].T) for l in data[(len(data)*3)//8:(len(data)*4)//8]]
+
+X_train, y_train = tracks_to_dataset(
+    train_tracks,
+    context_frames=5
 )
+
+X_val, y_val = tracks_to_dataset(
+    val_tracks,
+    context_frames=5
+)
+
+print("Training input:", X_train.shape)
+print("Training targets:", y_train.shape)
+
+print("Validation input:", X_val.shape)
+print("Validation targets:", y_val.shape)
+
+history = train_convnet(
+    model,
+    X_train,
+    y_train,
+    X_val,
+    y_val,
+    batch_size=128,
+    epochs=5,
+    checkpoint_path="best_convnet.keras",
+    output_path="convnet.keras",
+    target_mode="binary"
+)
+
+import matplotlib.pyplot as plt
+
+plt.figure(figsize=(10, 5))
+
+plt.plot(
+    history.history["loss"],
+    label="Training loss"
+)
+
+plt.plot(
+    history.history["val_loss"],
+    label="Validation loss"
+)
+
+plt.xlabel("Epoch")
+plt.ylabel("Loss")
+plt.legend()
+plt.grid()
+plt.show()
+
+print(H_f.shape)
+
+H_f = H[:88,:(H.shape[1]//5)*5].T
+predictions = model.predict(H_f.reshape(H_f.shape[0] // 5, 5, 88,1))
+
+binary_piano_roll = (predictions >= 0.5).astype(np.uint8)
+
+print(predictions)
+
+import matplotlib.pyplot as plt
+plt.figure()
+plt.imshow(binary_piano_roll.T, aspect='auto', origin='lower')
+'''for idx in onsets:
+    plt.axvline(x=idx, color='red', linewidth=0.8, alpha=0.8)'''
+plt.colorbar()
+plt.title("Activation matrix W")
+plt.xlabel("Time frames")
+plt.ylabel("Pitch / Component index")
+plt.show()
+
+print(H[:88,5:10].shape)
+
+data[0][0].shape
+
+print(len(train_tracks))
