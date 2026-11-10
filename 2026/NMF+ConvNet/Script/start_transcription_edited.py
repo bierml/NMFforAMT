@@ -7,6 +7,26 @@ Original file is located at
     https://colab.research.google.com/drive/131pIDrmvSXvAX-_17sRsFd7Zre4DAIth
 """
 from __future__ import annotations
+import random
+import os
+import keras
+from typing import Optional, Literal, Union, Mapping, Sequence
+import warnings
+import numpy as np
+from scipy.io import wavfile
+import librosa
+import pretty_midi
+import matplotlib.pyplot as plt
+from pathlib import Path
+import scipy
+from scipy.ndimage import label
+import soundfile as sf
+
+
+os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
+
+np.random.seed(42)
+ArrayLike = Union[np.ndarray, list]
 
 K = 5
 L = 0
@@ -45,17 +65,6 @@ is retained.
 
 Dependencies: NumPy only.
 """
-
-
-import os
-os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
-import keras
-from typing import Optional, Literal, Union, Mapping, Sequence
-import warnings
-import numpy as np
-np.random.seed(42)
-ArrayLike = Union[np.ndarray, list]
-
 
 class HNMA:
     """Regularized non-negative matrix factorization."""
@@ -1382,39 +1391,8 @@ def hnma(
         model
     )
 
-
-# Previous class spelling retained for compatibility.
-HNMF = HNMA
-
-from scipy.io import wavfile
-import librosa
-import numpy as np
-
-file_name_string_audio = "Prelude-in-E-Minor-Nr-4.wav"
-f_s, x = wavfile.read(file_name_string_audio)
-if(x.dtype==np.int32):
-  x = x / (2**31)
-elif(x.dtype==np.int16):
-  x = x / (2**15)
-else:
-  raise ValueError(f"Unsupported sample type: {x.dtype}")
-spectrogram = np.abs(librosa.cqt(x,sr=f_s, fmin=librosa.note_to_hz('A0'), bins_per_octave=12 * K, n_bins=88 * K+L, hop_length=HOP, sparsity=0.05))
-#spectrogram, P = librosa.decompose.hpss(spectrogram, margin=1.0)
-#spectrogram_1 = np.abs(librosa.cqt(x,sr=f_s, fmin=librosa.note_to_hz('A0'), bins_per_octave=12 * K, n_bins=88 * K, hop_length=HOP))
-onsets = librosa.onset.onset_detect(y=x, sr=f_s, hop_length=HOP,units='frames')
 def norm_log(H, gamma=5):
     return np.log1p(gamma * H)
-spectrogram = norm_log(spectrogram, g)
-spectrogram = librosa.util.normalize(spectrogram, norm = 2, axis = 0, threshold = 0.05)
-
-import matplotlib.pyplot as plt
-plt.figure()
-plt.imshow(spectrogram, aspect='auto', origin='lower')
-plt.colorbar()
-plt.title("Activation matrix W")
-plt.xlabel("Time frames")
-plt.ylabel("Pitch / Component index")
-plt.show()
 
 def build_W0(
     sr,
@@ -1500,55 +1478,7 @@ def build_noise_basis(n_bins, n_components=2):
         Wn[:, i] = x
 
     return Wn
-W_0 = build_W0(sr=f_s, bins_per_octave=12*K, n_bins=88 * K+L, fmin=librosa.note_to_hz('A0'), sigma=1.75)
-#W_0 = build_W0(sr=f_s, bins_per_octave=12*K, n_bins=88 * K, fmin=librosa.note_to_hz('A0'), sigma=2.0)
-Wn = build_noise_basis(88*K+L, 1)
-W_0 = np.concatenate([W_0, Wn], axis=1)
-#W_0 = W_norm(W_0)
-#print(W_0.shape)
-import matplotlib.pyplot as plt
-plt.figure()
-plt.imshow(W_0, aspect='auto', origin='lower')
-plt.colorbar()
-plt.title("Activation matrix W")
-plt.xlabel("Time frames")
-plt.ylabel("Pitch / Component index")
-plt.show()
 
-W, H, history = hnma(
-    spectrogram,
-    W_init=W_0,
-    n_components=88+1,
-    lambda_alpha=1e-3,
-    #beta_mode='temporal_smoothness',
-    #lambda_beta=1e-6,
-    #lambda_shift=0.1,
-    #shift_bins=33,
-    #lambda_volume=1e-3,
-    #volume_delta=1e-6,
-    #volume_mode = "max",
-    bins_per_octave=12*K,
-    max_iter=500,
-    tol=1e-5,
-    random_state=42,
-)
-
-V_hat = W @ H
-
-print("W:", W.shape)
-print("H:", H.shape)
-
-import matplotlib.pyplot as plt
-plt.figure()
-plt.imshow(W, aspect='auto', origin='lower')
-plt.colorbar()
-plt.title("Activation matrix W")
-plt.xlabel("Time frames")
-plt.ylabel("Pitch / Component index")
-plt.show()
-
-import scipy
-from scipy.ndimage import label
 def med_filter(X, sz=5):
   X_r = np.zeros(X.shape)
   for i in range(X.shape[0]):
@@ -1562,31 +1492,6 @@ def enforce_min_duration(B, min_len=10):
             if np.sum(labels == i) < min_len:
                 B[q][labels == i] = 0
     return B
-
-H1 = med_filter(H,sz=9)
-#H1 = med_filter(H)
-H2 = np.zeros_like(H1)
-idx = np.argpartition(H1, -10, axis=0)[-10:, :]
-H2[idx, np.arange(H1.shape[1])] = H1[idx, np.arange(H1.shape[1])]
-H3 = med_filter(H2,sz=7)
-t = H3.max() * 0.125
-H4 = (H3 > t).astype(int)
-H5 = enforce_min_duration(H4,min_len=15)[0:88,:]
-#z = analyse_spectrogram(spectrogram, onsets)
-#H6 = clear_H(H5,onsets,z)
-import matplotlib.pyplot as plt
-plt.figure()
-plt.imshow(H5, aspect='auto', origin='lower')
-'''for idx in onsets:
-    plt.axvline(x=idx, color='red', linewidth=0.8, alpha=0.8)'''
-plt.colorbar()
-plt.title("Activation matrix W")
-plt.xlabel("Time frames")
-plt.ylabel("Pitch / Component index")
-plt.show()
-
-import numpy as np
-import pretty_midi
 
 def midi_to_binary_matrix(
     midi_input,
@@ -1646,24 +1551,6 @@ def midi_to_binary_matrix(
 
     return B, frame_times
 
-# 20 ms frames (matches typical STFT hop ~512 @ 44.1kHz)
-dt = HOP / f_s
-B, times = midi_to_binary_matrix(
-    "Prelude-in-E-Minor-Nr-4.mid",
-    dt=dt
-)
-print(B.shape,H4.shape)
-import matplotlib.pyplot as plt
-plt.figure()
-plt.imshow(B, aspect='auto', origin='lower')
-#for idx in onsets:
-#    plt.axvline(x=idx, color='red', linewidth=0.8, alpha=0.8)
-plt.colorbar()
-plt.title("Activation matrix H")
-plt.xlabel("Time frames")
-plt.ylabel("Pitch / Component index")
-plt.show()
-
 def evaluate_results(H_et,H):
   #H_et - reference transcription of the piece
   #H - estimated transcription of the piece
@@ -1683,19 +1570,6 @@ def evaluate_results(H_et,H):
   F1 = 2 * P * R / (P + R)
   return (P,R,F1)
 
-print(H5.shape)
-
-print(evaluate_results(H5[:,:B.shape[1]],B))
-
-from pathlib import Path
-def get_files(extension):
-    return [str(file) for file in Path.cwd().rglob("*."+extension)]
-l = get_files("")
-print(l)
-
-import soundfile as sf
-import numpy as np
-
 def read_wav_as_float(file_path):
 
     # Read audio directly as float32
@@ -1718,101 +1592,8 @@ def read_wav_as_float(file_path):
 
     return sr, np.ascontiguousarray(x)
 
-def midi_to_cqt_labels(
-    midi_input,
-    n_frames,
-    sr,
-    hop_length,
-    pitch_range=(21, 108)
-):
-    """
-    Generate MIDI ground-truth labels at CQT frame centers.
-
-    Returns
-    -------
-    B : ndarray, shape (n_pitches, n_frames)
-        Binary piano roll.
-    """
-
-    if isinstance(midi_input, str):
-        midi = pretty_midi.PrettyMIDI(midi_input)
-    else:
-        midi = midi_input
-
-    dt = hop_length / sr
-
-    # CQT frame center timestamps
-    times = np.arange(n_frames) * dt
-
-    pitches = np.arange(
-        pitch_range[0],
-        pitch_range[1] + 1
-    )
-
-    B = np.zeros(
-        (len(pitches), n_frames),
-        dtype=np.uint8
-    )
-
-    for instrument in midi.instruments:
-
-        for note in instrument.notes:
-
-            if note.pitch not in pitches:
-                continue
-
-            pitch_idx = note.pitch - pitch_range[0]
-
-            active = (
-                (times >= note.start) &
-                (times < note.end)
-            )
-
-            B[pitch_idx, active] = 1
-
-    return B
-
-M = midi_to_cqt_labels("Prelude-in-E-Minor-Nr-4.mid", H.shape[1], 44100,2048)
-import matplotlib.pyplot as plt
-
-plt.imshow(M, aspect='auto', origin='lower')
-#for idx in onsets:
-#    plt.axvline(x=idx, color='red', linewidth=0.8, alpha=0.8)
-plt.colorbar()
-plt.title("Activation matrix H")
-plt.xlabel("Time frames")
-plt.ylabel("Pitch / Component index")
-plt.show()
-
-from pathlib import Path
 def get_files(extension):
     return [str(file) for file in Path.cwd().rglob("*."+extension)]
-l = get_files("")
-print(l)
-
-import soundfile as sf
-
-def read_wav_as_float(file_path):
-
-    # Read audio directly as float32
-    x, sr = sf.read(
-        file_path,
-        dtype="float32",
-        always_2d=True
-    )
-
-    n_frames, n_channels = x.shape
-
-    print(
-        f"Channels: {n_channels}, "
-        f"Sample Rate: {sr}, "
-        f"Frames: {n_frames}"
-    )
-
-    # Convert stereo/multichannel audio to mono
-    x = np.mean(x, axis=1, dtype=np.float32)
-
-    return sr, np.ascontiguousarray(x)
 
 def midi_to_cqt_labels(
     midi_input,
@@ -1900,27 +1681,6 @@ def midi_to_cqt_labels(
                 )
 
     return B
-
-import matplotlib.pyplot as plt
-plt.figure()
-plt.imshow(H, aspect='auto', origin='lower')
-'''for idx in onsets:
-    plt.axvline(x=idx, color='red', linewidth=0.8, alpha=0.8)'''
-plt.colorbar()
-plt.title("Activation matrix W")
-plt.xlabel("Time frames")
-plt.ylabel("Pitch / Component index")
-plt.show()
-
-print(np.sum(W[:,46]))
-
-X = np.zeros((88,H.shape[1]))
-print(X.shape)
-print(H.shape)
-
-import numpy as np
-import tensorflow as tf
-
 
 def build_convnet(
     K=5,
@@ -2091,7 +1851,7 @@ def train_convnet(
     X_val,
     y_val,
     batch_size=128,
-    epochs=100,
+    epochs=20,
     checkpoint_path="best_convnet.keras",
     output_path="convnet.keras",
     target_mode="binary"
@@ -2325,6 +2085,8 @@ def tracks_to_dataset(
     )
 def extract_binary_data():
   l = get_files("wav")
+  #print(l)
+  l.remove("/home/debian/tensorflow-project/Prelude-in-E-Minor-Nr-4.wav")
   r = get_files("mid")
   for m in l.copy():
     if(not m[:-3]+"mid" in r):
@@ -2362,21 +2124,162 @@ def extract_binary_data():
   return data
 
 
-import random
+# Previous class spelling retained for compatibility.
+HNMF = HNMA
+
+file_name_string_audio = "Prelude-in-E-Minor-Nr-4.wav"
+f_s, x = wavfile.read(file_name_string_audio)
+if(x.dtype==np.int32):
+  x = x / (2**31)
+elif(x.dtype==np.int16):
+  x = x / (2**15)
+else:
+  raise ValueError(f"Unsupported sample type: {x.dtype}")
+spectrogram = np.abs(librosa.cqt(x,sr=f_s, fmin=librosa.note_to_hz('A0'), bins_per_octave=12 * K, n_bins=88 * K+L, hop_length=HOP, sparsity=0.05))
+onsets = librosa.onset.onset_detect(y=x, sr=f_s, hop_length=HOP,units='frames')
+
+spectrogram = norm_log(spectrogram, g)
+spectrogram = librosa.util.normalize(spectrogram, norm = 2, axis = 0, threshold = 0.05)
+
+plt.figure()
+plt.imshow(spectrogram, aspect='auto', origin='lower')
+plt.colorbar()
+plt.title("Activation matrix W")
+plt.xlabel("Time frames")
+plt.ylabel("Pitch / Component index")
+plt.show()
+
+W_0 = build_W0(sr=f_s, bins_per_octave=12*K, n_bins=88 * K+L, fmin=librosa.note_to_hz('A0'), sigma=1.75)
+#W_0 = build_W0(sr=f_s, bins_per_octave=12*K, n_bins=88 * K, fmin=librosa.note_to_hz('A0'), sigma=2.0)
+Wn = build_noise_basis(88*K+L, 1)
+W_0 = np.concatenate([W_0, Wn], axis=1)
+#W_0 = W_norm(W_0)
+#print(W_0.shape)
+plt.figure()
+plt.imshow(W_0, aspect='auto', origin='lower')
+plt.colorbar()
+plt.title("Activation matrix W")
+plt.xlabel("Time frames")
+plt.ylabel("Pitch / Component index")
+plt.show()
+
+W, H, history = hnma(
+    spectrogram,
+    W_init=W_0,
+    n_components=88+1,
+    lambda_alpha=1e-3,
+    #beta_mode='temporal_smoothness',
+    #lambda_beta=1e-6,
+    #lambda_shift=0.1,
+    #shift_bins=33,
+    #lambda_volume=1e-3,
+    #volume_delta=1e-6,
+    #volume_mode = "max",
+    bins_per_octave=12*K,
+    max_iter=500,
+    tol=1e-5,
+    random_state=42,
+)
+
+V_hat = W @ H
+
+print("W:", W.shape)
+print("H:", H.shape)
+
+plt.figure()
+plt.imshow(W, aspect='auto', origin='lower')
+plt.colorbar()
+plt.title("Activation matrix W")
+plt.xlabel("Time frames")
+plt.ylabel("Pitch / Component index")
+plt.show()
+
+H1 = med_filter(H,sz=9)
+#H1 = med_filter(H)
+H2 = np.zeros_like(H1)
+idx = np.argpartition(H1, -10, axis=0)[-10:, :]
+H2[idx, np.arange(H1.shape[1])] = H1[idx, np.arange(H1.shape[1])]
+H3 = med_filter(H2,sz=7)
+t = H3.max() * 0.125
+H4 = (H3 > t).astype(int)
+H5 = enforce_min_duration(H4,min_len=15)[0:88,:]
+#z = analyse_spectrogram(spectrogram, onsets)
+#H6 = clear_H(H5,onsets,z)
+plt.figure()
+plt.imshow(H5, aspect='auto', origin='lower')
+plt.colorbar()
+plt.title("Activation matrix W")
+plt.xlabel("Time frames")
+plt.ylabel("Pitch / Component index")
+plt.show()
+
+# 20 ms frames (matches typical STFT hop ~512 @ 44.1kHz)
+dt = HOP / f_s
+B, times = midi_to_binary_matrix(
+    "Prelude-in-E-Minor-Nr-4.mid",
+    dt=dt
+)
+print(B.shape,H4.shape)
+plt.figure()
+plt.imshow(B, aspect='auto', origin='lower')
+plt.colorbar()
+plt.title("Activation matrix H")
+plt.xlabel("Time frames")
+plt.ylabel("Pitch / Component index")
+plt.show()
+
+print(H5.shape)
+
+print(evaluate_results(H5[:,:B.shape[1]],B))
+
+
+
+l = get_files("")
+print(l)
+
+M = midi_to_cqt_labels("Prelude-in-E-Minor-Nr-4.mid", H.shape[1], 44100,2048)
+
+plt.imshow(M, aspect='auto', origin='lower')
+plt.colorbar()
+plt.title("Activation matrix H")
+plt.xlabel("Time frames")
+plt.ylabel("Pitch / Component index")
+plt.show()
+
+l = get_files("")
+print(l)
+
+plt.figure()
+plt.imshow(H, aspect='auto', origin='lower')
+'''for idx in onsets:
+    plt.axvline(x=idx, color='red', linewidth=0.8, alpha=0.8)'''
+plt.colorbar()
+plt.title("Activation matrix W")
+plt.xlabel("Time frames")
+plt.ylabel("Pitch / Component index")
+plt.show()
+
+print(np.sum(W[:,46]))
+
+X = np.zeros((88,H.shape[1]))
+print(X.shape)
+print(H.shape)
+
 model = build_convnet(
     K=1,
     context_frames=5,
     n_pitches=88,
     target_mode="binary",
-    learning_rate=1e-3
+    learning_rate=1e-5
 )
 
 model.summary()
+
 data = extract_binary_data()
 random.shuffle(data)
 
-train_tracks = [(l[0].T,l[1].T) for l in data[0:(len(data)*3)//8]]
-val_tracks = [(l[0].T,l[1].T) for l in data[(len(data)*3)//8:(len(data)*4)//8]]
+train_tracks = [(l[0].T,l[1].T) for l in data[0:(len(data)*6)//8]]
+val_tracks = [(l[0].T,l[1].T) for l in data[(len(data)*6)//8:(len(data)*8)//8]]
 
 X_train, y_train = tracks_to_dataset(
     train_tracks,
@@ -2407,8 +2310,6 @@ history = train_convnet(
     target_mode="binary"
 )
 
-import matplotlib.pyplot as plt
-
 plt.figure(figsize=(10, 5))
 
 plt.plot(
@@ -2437,12 +2338,8 @@ binary_piano_roll = (predictions >= 0.1).astype(np.uint8)
 print(predictions)
 np.savez("res_data.npz", M=M, H=H, predictions=predictions)
 
-import matplotlib.pyplot as plt
 plt.figure()
-#plt.imshow(binary_piano_roll.T, aspect='auto', origin='lower')
 plt.imshow(data[0][1], aspect='auto', origin='lower')
-'''for idx in onsets:
-    plt.axvline(x=idx, color='red', linewidth=0.8, alpha=0.8)'''
 plt.colorbar()
 plt.title("Activation matrix W")
 plt.xlabel("Time frames")

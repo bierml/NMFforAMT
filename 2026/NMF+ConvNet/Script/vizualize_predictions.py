@@ -28,6 +28,9 @@ plt.show()'''
 
 import numpy as np
 import tensorflow as tf
+import os
+os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
+import keras
 
 def evaluate_results(H_et,H):
   #H_et - reference transcription of the piece
@@ -83,7 +86,7 @@ for i in range(2, H.shape[1] - 2):
 
 workflow = np.array(workflow)
 
-binary_piano_roll = (workflow >= 0.1).astype(np.uint8).T
+binary_piano_roll = (workflow >= 0.08).astype(np.uint8).T
 
 
 import matplotlib.pyplot as plt
