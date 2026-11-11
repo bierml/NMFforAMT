@@ -2125,156 +2125,196 @@ def extract_binary_data():
 # Previous class spelling retained for compatibility.
 HNMF = HNMA
 
-file_name_string_audio = "Prelude-in-E-Minor-Nr-4.wav"
-f_s, x = wavfile.read(file_name_string_audio)
-if(x.dtype==np.int32):
-  x = x / (2**31)
-elif(x.dtype==np.int16):
-  x = x / (2**15)
+my_file = Path("./traindata.npz")
+if my_file.is_file():
+    model = build_convnet(
+        K=1,
+        context_frames=5,
+        n_pitches=88,
+        target_mode="binary",
+        learning_rate=1e-5
+    )
+    model.summary()
+    loaded = np.load("traindata.npz")
+    data = [
+        loaded[f"data_{i}"]
+        for i in range(64)
+    ]
+    H = loaded["H"]
+    H1 = med_filter(H,sz=9)
+    #H1 = med_filter(H)
+    H2 = np.zeros_like(H1)
+    idx = np.argpartition(H1, -10, axis=0)[-10:, :]
+    H2[idx, np.arange(H1.shape[1])] = H1[idx, np.arange(H1.shape[1])]
+    H3 = med_filter(H2,sz=7)
+    t = H3.max() * 0.125
+    H4 = (H3 > t).astype(int)
+    H5 = enforce_min_duration(H4,min_len=15)[0:88,:]
+    M = midi_to_cqt_labels("Prelude-in-E-Minor-Nr-4.mid", H.shape[1], 44100,2048)
+    #z = analyse_spectrogram(spectrogram, onsets)
+    #H6 = clear_H(H5,onsets,z)
+    plt.figure()
+    plt.imshow(H5, aspect='auto', origin='lower')
+    plt.colorbar()
+    plt.title("Activation matrix W")
+    plt.xlabel("Time frames")
+    plt.ylabel("Pitch / Component index")
+    plt.show()
 else:
-  raise ValueError(f"Unsupported sample type: {x.dtype}")
-spectrogram = np.abs(librosa.cqt(x,sr=f_s, fmin=librosa.note_to_hz('A0'), bins_per_octave=12 * K, n_bins=88 * K+L, hop_length=HOP, sparsity=0.05))
-onsets = librosa.onset.onset_detect(y=x, sr=f_s, hop_length=HOP,units='frames')
+    file_name_string_audio = "Prelude-in-E-Minor-Nr-4.wav"
+    f_s, x = wavfile.read(file_name_string_audio)
+    if(x.dtype==np.int32):
+      x = x / (2**31)
+    elif(x.dtype==np.int16):
+      x = x / (2**15)
+    else:
+      raise ValueError(f"Unsupported sample type: {x.dtype}")
+    spectrogram = np.abs(librosa.cqt(x,sr=f_s, fmin=librosa.note_to_hz('A0'), bins_per_octave=12 * K, n_bins=88 * K+L, hop_length=HOP, sparsity=0.05))
+    onsets = librosa.onset.onset_detect(y=x, sr=f_s, hop_length=HOP,units='frames')
 
-spectrogram = norm_log(spectrogram, g)
-spectrogram = librosa.util.normalize(spectrogram, norm = 2, axis = 0, threshold = 0.05)
+    spectrogram = norm_log(spectrogram, g)
+    spectrogram = librosa.util.normalize(spectrogram, norm = 2, axis = 0, threshold = 0.05)
 
-plt.figure()
-plt.imshow(spectrogram, aspect='auto', origin='lower')
-plt.colorbar()
-plt.title("Activation matrix W")
-plt.xlabel("Time frames")
-plt.ylabel("Pitch / Component index")
-plt.show()
+    plt.figure()
+    plt.imshow(spectrogram, aspect='auto', origin='lower')
+    plt.colorbar()
+    plt.title("Activation matrix W")
+    plt.xlabel("Time frames")
+    plt.ylabel("Pitch / Component index")
+    plt.show()
 
-W_0 = build_W0(sr=f_s, bins_per_octave=12*K, n_bins=88 * K+L, fmin=librosa.note_to_hz('A0'), sigma=1.75)
-#W_0 = build_W0(sr=f_s, bins_per_octave=12*K, n_bins=88 * K, fmin=librosa.note_to_hz('A0'), sigma=2.0)
-Wn = build_noise_basis(88*K+L, 1)
-W_0 = np.concatenate([W_0, Wn], axis=1)
-#W_0 = W_norm(W_0)
-#print(W_0.shape)
-plt.figure()
-plt.imshow(W_0, aspect='auto', origin='lower')
-plt.colorbar()
-plt.title("Activation matrix W")
-plt.xlabel("Time frames")
-plt.ylabel("Pitch / Component index")
-plt.show()
+    W_0 = build_W0(sr=f_s, bins_per_octave=12*K, n_bins=88 * K+L, fmin=librosa.note_to_hz('A0'), sigma=1.75)
+    Wn = build_noise_basis(88*K+L, 1)
+    W_0 = np.concatenate([W_0, Wn], axis=1)
+    plt.figure()
+    plt.imshow(W_0, aspect='auto', origin='lower')
+    plt.colorbar()
+    plt.title("Activation matrix W")
+    plt.xlabel("Time frames")
+    plt.ylabel("Pitch / Component index")
+    plt.show()
 
-W, H, history = hnma(
-    spectrogram,
-    W_init=W_0,
-    n_components=88+1,
-    lambda_alpha=1e-3,
-    #beta_mode='temporal_smoothness',
-    #lambda_beta=1e-6,
-    #lambda_shift=0.1,
-    #shift_bins=33,
-    #lambda_volume=1e-3,
-    #volume_delta=1e-6,
-    #volume_mode = "max",
-    bins_per_octave=12*K,
-    max_iter=500,
-    tol=1e-5,
-    random_state=42,
-)
+    W, H, history = hnma(
+        spectrogram,
+        W_init=W_0,
+        n_components=88+1,
+        lambda_alpha=1e-3,
+        #beta_mode='temporal_smoothness',
+        #lambda_beta=1e-6,
+        #lambda_shift=0.1,
+        #shift_bins=33,
+        #lambda_volume=1e-3,
+        #volume_delta=1e-6,
+        #volume_mode = "max",
+        bins_per_octave=12*K,
+        max_iter=500,
+        tol=1e-5,
+        random_state=42,
+    )
 
-V_hat = W @ H
+    V_hat = W @ H
 
-print("W:", W.shape)
-print("H:", H.shape)
+    print("W:", W.shape)
+    print("H:", H.shape)
 
-plt.figure()
-plt.imshow(W, aspect='auto', origin='lower')
-plt.colorbar()
-plt.title("Activation matrix W")
-plt.xlabel("Time frames")
-plt.ylabel("Pitch / Component index")
-plt.show()
+    plt.figure()
+    plt.imshow(W, aspect='auto', origin='lower')
+    plt.colorbar()
+    plt.title("Activation matrix W")
+    plt.xlabel("Time frames")
+    plt.ylabel("Pitch / Component index")
+    plt.show()
 
-H1 = med_filter(H,sz=9)
-#H1 = med_filter(H)
-H2 = np.zeros_like(H1)
-idx = np.argpartition(H1, -10, axis=0)[-10:, :]
-H2[idx, np.arange(H1.shape[1])] = H1[idx, np.arange(H1.shape[1])]
-H3 = med_filter(H2,sz=7)
-t = H3.max() * 0.125
-H4 = (H3 > t).astype(int)
-H5 = enforce_min_duration(H4,min_len=15)[0:88,:]
-#z = analyse_spectrogram(spectrogram, onsets)
-#H6 = clear_H(H5,onsets,z)
-plt.figure()
-plt.imshow(H5, aspect='auto', origin='lower')
-plt.colorbar()
-plt.title("Activation matrix W")
-plt.xlabel("Time frames")
-plt.ylabel("Pitch / Component index")
-plt.show()
+    H1 = med_filter(H,sz=9)
+    #H1 = med_filter(H)
+    H2 = np.zeros_like(H1)
+    idx = np.argpartition(H1, -10, axis=0)[-10:, :]
+    H2[idx, np.arange(H1.shape[1])] = H1[idx, np.arange(H1.shape[1])]
+    H3 = med_filter(H2,sz=7)
+    t = H3.max() * 0.125
+    H4 = (H3 > t).astype(int)
+    H5 = enforce_min_duration(H4,min_len=15)[0:88,:]
+    #z = analyse_spectrogram(spectrogram, onsets)
+    #H6 = clear_H(H5,onsets,z)
+    plt.figure()
+    plt.imshow(H5, aspect='auto', origin='lower')
+    plt.colorbar()
+    plt.title("Activation matrix W")
+    plt.xlabel("Time frames")
+    plt.ylabel("Pitch / Component index")
+    plt.show()
 
-# 20 ms frames (matches typical STFT hop ~512 @ 44.1kHz)
-dt = HOP / f_s
-B, times = midi_to_binary_matrix(
-    "Prelude-in-E-Minor-Nr-4.mid",
-    dt=dt
-)
-print(B.shape,H4.shape)
-plt.figure()
-plt.imshow(B, aspect='auto', origin='lower')
-plt.colorbar()
-plt.title("Activation matrix H")
-plt.xlabel("Time frames")
-plt.ylabel("Pitch / Component index")
-plt.show()
+    # 20 ms frames (matches typical STFT hop ~512 @ 44.1kHz)
+    dt = HOP / f_s
+    B, times = midi_to_binary_matrix(
+        "Prelude-in-E-Minor-Nr-4.mid",
+        dt=dt
+    )
+    print(B.shape,H4.shape)
+    plt.figure()
+    plt.imshow(B, aspect='auto', origin='lower')
+    plt.colorbar()
+    plt.title("Activation matrix H")
+    plt.xlabel("Time frames")
+    plt.ylabel("Pitch / Component index")
+    plt.show()
 
-print(H5.shape)
+    print(H5.shape)
 
-print(evaluate_results(H5[:,:B.shape[1]],B))
+    print(evaluate_results(H5[:,:B.shape[1]],B))
 
 
 
-l = get_files("")
-print(l)
+    l = get_files("")
+    print(l)
 
-M = midi_to_cqt_labels("Prelude-in-E-Minor-Nr-4.mid", H.shape[1], 44100,2048)
+    M = midi_to_cqt_labels("Prelude-in-E-Minor-Nr-4.mid", H.shape[1], 44100,2048)
 
-plt.imshow(M, aspect='auto', origin='lower')
-plt.colorbar()
-plt.title("Activation matrix H")
-plt.xlabel("Time frames")
-plt.ylabel("Pitch / Component index")
-plt.show()
+    plt.imshow(M, aspect='auto', origin='lower')
+    plt.colorbar()
+    plt.title("Activation matrix H")
+    plt.xlabel("Time frames")
+    plt.ylabel("Pitch / Component index")
+    plt.show()
 
-l = get_files("")
-print(l)
+    l = get_files("")
+    print(l)
 
-plt.figure()
-plt.imshow(H, aspect='auto', origin='lower')
-'''for idx in onsets:
-    plt.axvline(x=idx, color='red', linewidth=0.8, alpha=0.8)'''
-plt.colorbar()
-plt.title("Activation matrix W")
-plt.xlabel("Time frames")
-plt.ylabel("Pitch / Component index")
-plt.show()
+    plt.figure()
+    plt.imshow(H, aspect='auto', origin='lower')
+    '''for idx in onsets:
+        plt.axvline(x=idx, color='red', linewidth=0.8, alpha=0.8)'''
+    plt.colorbar()
+    plt.title("Activation matrix W")
+    plt.xlabel("Time frames")
+    plt.ylabel("Pitch / Component index")
+    plt.show()
 
-print(np.sum(W[:,46]))
+    print(np.sum(W[:,46]))
 
-X = np.zeros((88,H.shape[1]))
-print(X.shape)
-print(H.shape)
+    X = np.zeros((88,H.shape[1]))
+    print(X.shape)
+    print(H.shape)
 
-model = build_convnet(
-    K=1,
-    context_frames=5,
-    n_pitches=88,
-    target_mode="binary",
-    learning_rate=1e-5
-)
+    model = build_convnet(
+        K=1,
+        context_frames=5,
+        n_pitches=88,
+        target_mode="binary",
+        learning_rate=1e-5
+    )
 
-model.summary()
-
-data = extract_binary_data()
-random.shuffle(data)
+    model.summary()
+    data = extract_binary_data()
+    random.shuffle(data)
+    save_dict = {
+        f"data_{i}": matrix
+        for i, matrix in enumerate(data)
+    }
+    
+    save_dict["H"] = H
+    
+    np.savez("traindata.npz", **save_dict)
 
 train_tracks = [(l[0].T,l[1].T) for l in data[0:(len(data)*6)//8]]
 val_tracks = [(l[0].T,l[1].T) for l in data[(len(data)*6)//8:(len(data)*8)//8]]

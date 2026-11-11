@@ -53,7 +53,7 @@ def evaluate_results(H_et,H):
 
 # Load the trained model
 model = tf.keras.models.load_model("best_convnet.keras")
-data = np.load("res_data.npz")
+data = np.load("res_data.npz",allow_pickle=True)
 M = data["M"]
 H = data["H"]
 predictions = data["predictions"]
