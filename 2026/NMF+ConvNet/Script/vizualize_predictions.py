@@ -31,6 +31,70 @@ import tensorflow as tf
 import os
 os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
 import keras
+from scipy.io import wavfile
+import librosa
+from scipy.ndimage import label
+
+def postprocess_binary_piano_roll(piano_roll, onsets, threshold):
+    """
+    Remove notes whose starting frames are too far from the nearest onset.
+
+    Parameters
+    ----------
+    piano_roll : np.ndarray
+        Binary piano roll of shape (n_pitches, n_frames).
+    onsets : list or np.ndarray
+        Reference onset indices (in frames).
+    threshold : int
+        Maximum allowed distance between a note onset and
+        its nearest reference onset, in frames.
+
+    Returns
+    -------
+    np.ndarray
+        Processed binary piano roll (a copy of the input).
+    """
+
+    result = np.array(piano_roll, copy=True)
+    onsets = np.asarray(onsets, dtype=int)
+
+    if onsets.size == 0:
+        return np.zeros_like(result)
+
+    for pitch in range(result.shape[0]):
+
+        row = result[pitch]
+
+        # Find note starting frames (0 -> 1 transitions).
+        note_starts = np.where(
+            np.diff(np.pad(row, (1, 0))) == 1
+        )[0]
+
+        for start in note_starts:
+
+            # Distance to the nearest reference onset.
+            nearest_distance = np.min(np.abs(onsets - start))
+
+            # Remove the entire note if it exceeds the threshold.
+            if nearest_distance > threshold:
+
+                # Find the end of the continuous sequence of ones.
+                end = start
+                while end < row.size and row[end] == 1:
+                    end += 1
+
+                result[pitch, start:end] = 0
+
+    return result
+
+
+def enforce_min_duration(B, min_len=10):
+    for q in range(B.shape[0]):
+        labels, n = label(B[q])
+        for i in range(1, n+1):
+            if np.sum(labels == i) < min_len:
+                B[q][labels == i] = 0
+    return B
 
 def evaluate_results(H_et,H):
   #H_et - reference transcription of the piece
@@ -71,6 +135,18 @@ binary_piano_roll = (workflow >= 0.1).astype(np.uint8).T'''
 #predictions = model.predict(H_f.reshape(H_f.shape[0] // 5, 5, 88,1))
 #binary_piano_roll = (predictions >= 0.1).astype(np.uint8).T
 
+file_name_string_audio = "Prelude-in-E-Minor-Nr-4.wav"
+f_s, x = wavfile.read(file_name_string_audio)
+if(x.dtype==np.int32):
+  x = x / (2**31)
+elif(x.dtype==np.int16):
+  x = x / (2**15)
+else:
+  raise ValueError(f"Unsupported sample type: {x.dtype}")
+spectrogram = np.abs(librosa.cqt(x,sr=f_s, fmin=librosa.note_to_hz('A0'), bins_per_octave=12 * 5, n_bins=88 * 5+0, hop_length=2048, sparsity=0.05))
+onsets = librosa.onset.onset_detect(y=x, sr=f_s, hop_length=2048,units='frames')
+
+
 workflow = []
 
 for i in range(2, H.shape[1] - 2):
@@ -86,16 +162,28 @@ for i in range(2, H.shape[1] - 2):
 
 workflow = np.array(workflow)
 
-binary_piano_roll = (workflow >= 0.08).astype(np.uint8).T
-
+binary_piano_roll = (workflow >= 0.1).astype(np.uint8).T
+binary_piano_roll = postprocess_binary_piano_roll(binary_piano_roll, onsets, 12)
+binary_piano_roll = enforce_min_duration(binary_piano_roll,min_len=5)
 
 import matplotlib.pyplot as plt
 plt.figure()
 plt.imshow(binary_piano_roll, aspect='auto', origin='lower')
+'''for idx in onsets:
+    plt.axvline(x=idx, color='red', linewidth=0.8, alpha=0.8)'''
 plt.colorbar()
 plt.title("Activation matrix W")
 plt.xlabel("Time frames")
 plt.ylabel("Pitch / Component index")
 plt.show()
 
+plt.figure()
+plt.imshow(M, aspect='auto', origin='lower')
+'''for idx in onsets:
+    plt.axvline(x=idx, color='red', linewidth=0.8, alpha=0.8)'''
+plt.colorbar()
+plt.title("Activation matrix W")
+plt.xlabel("Time frames")
+plt.ylabel("Pitch / Component index")
+plt.show()
 print(evaluate_results(M[:,2:-2],binary_piano_roll))
