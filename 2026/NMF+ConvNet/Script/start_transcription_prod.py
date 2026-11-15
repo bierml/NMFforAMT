@@ -1849,7 +1849,7 @@ def train_convnet(
     X_val,
     y_val,
     batch_size=128,
-    epochs=20,
+    epochs=50,
     checkpoint_path="best_convnet.keras",
     output_path="convnet.keras",
     target_mode="binary"
@@ -2113,7 +2113,7 @@ def extract_binary_data():
       n_frames=H.shape[1],
       sr=f_s,
       hop_length=HOP,
-      mode="normalized"
+      mode="binary"
     )
     print(H.shape[1],B.shape[1])
     data.append((H[0:88,:],B))
@@ -2211,7 +2211,7 @@ else:
         tol=1e-5,
         random_state=42,
     )
-
+    
     V_hat = W @ H
 
     print("W:", W.shape)
@@ -2261,10 +2261,7 @@ else:
 
     print(H5.shape)
 
-    print(evaluate_results(H5[:,:B.shape[1]],B))
-
-
-
+    print(evaluate_results(H5[:,:B.shape[1]],B))    
     l = get_files("")
     print(l)
 
@@ -2316,8 +2313,8 @@ else:
     
     np.savez("traindata.npz", **save_dict)
 
-train_tracks = [(l[0].T,l[1].T) for l in data[0:(len(data)*6)//8]]
-val_tracks = [(l[0].T,l[1].T) for l in data[(len(data)*6)//8:(len(data)*8)//8]]
+train_tracks = [(l[0].T,l[1].T) for l in data[0:(len(data)*3)//8]]
+val_tracks = [(l[0].T,l[1].T) for l in data[(len(data)*3)//8:(len(data)*4)//8]]
 
 X_train, y_train = tracks_to_dataset(
     train_tracks,
@@ -2342,7 +2339,7 @@ history = train_convnet(
     X_val,
     y_val,
     batch_size=128,
-    epochs=20,
+    epochs=50,
     checkpoint_path="best_convnet.keras",
     output_path="convnet.keras",
     target_mode="binary"
@@ -2365,7 +2362,6 @@ plt.ylabel("Loss")
 plt.legend()
 plt.grid()
 plt.show()
-
 
 H_f = H[:88,:(H.shape[1]//5)*5].T
 

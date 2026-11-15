@@ -162,9 +162,9 @@ for i in range(2, H.shape[1] - 2):
 
 workflow = np.array(workflow)
 
-binary_piano_roll = (workflow >= 0.1).astype(np.uint8).T
+binary_piano_roll = (workflow >= 0.12).astype(np.uint8).T
 binary_piano_roll = postprocess_binary_piano_roll(binary_piano_roll, onsets, 12)
-binary_piano_roll = enforce_min_duration(binary_piano_roll,min_len=5)
+binary_piano_roll = enforce_min_duration(binary_piano_roll,min_len=12)
 
 import matplotlib.pyplot as plt
 plt.figure()
