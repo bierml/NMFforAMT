@@ -1803,8 +1803,7 @@ def build_convnet(
     # Compile
     if target_mode == "binary":
 
-        loss = tf.keras.losses.BinaryCrossentropy()
-
+        loss = tf.keras.losses.BinaryFocalCrossentropy(gamma=2.0)
         metrics = [
             tf.keras.metrics.BinaryAccuracy(
                 name="binary_accuracy"
@@ -2096,8 +2095,8 @@ def extract_binary_data():
     Wn = build_noise_basis(88*K+L, 1)
     W_0 = np.concatenate([W_0, Wn], axis=1)
     spectrogram = np.abs(librosa.cqt(x,sr=f_s, fmin=librosa.note_to_hz('A0'), bins_per_octave=12 * K, n_bins=88 * K+L, hop_length=HOP, sparsity=0.05))
-    spectrogram = norm_log(spectrogram, g)
-    spectrogram = librosa.util.normalize(spectrogram, norm = 2, axis = 0, threshold = 0.05)
+    #spectrogram = norm_log(spectrogram, g)
+    #spectrogram = librosa.util.normalize(spectrogram, norm = 2, axis = 0, threshold = 0.05)
     W, H, history = hnma(
         spectrogram,
         W_init=W_0,
@@ -2132,7 +2131,7 @@ if my_file.is_file():
         context_frames=5,
         n_pitches=88,
         target_mode="binary",
-        learning_rate=1e-5
+        learning_rate=1e-3
     )
     model.summary()
     loaded = np.load("traindata.npz")
@@ -2172,8 +2171,8 @@ else:
     spectrogram = np.abs(librosa.cqt(x,sr=f_s, fmin=librosa.note_to_hz('A0'), bins_per_octave=12 * K, n_bins=88 * K+L, hop_length=HOP, sparsity=0.05))
     onsets = librosa.onset.onset_detect(y=x, sr=f_s, hop_length=HOP,units='frames')
 
-    spectrogram = norm_log(spectrogram, g)
-    spectrogram = librosa.util.normalize(spectrogram, norm = 2, axis = 0, threshold = 0.05)
+    #spectrogram = norm_log(spectrogram, g)
+    #spectrogram = librosa.util.normalize(spectrogram, norm = 2, axis = 0, threshold = 0.05)
 
     plt.figure()
     plt.imshow(spectrogram, aspect='auto', origin='lower')
@@ -2298,7 +2297,7 @@ else:
         context_frames=5,
         n_pitches=88,
         target_mode="binary",
-        learning_rate=1e-5
+        learning_rate=1e-3
     )
 
     model.summary()
@@ -2364,26 +2363,7 @@ plt.grid()
 plt.show()
 
 H_f = H[:88,:(H.shape[1]//5)*5].T
-
 predictions = model.predict(H_f.reshape(H_f.shape[0] // 5, 5, 88,1))
-
 binary_piano_roll = (predictions >= 0.1).astype(np.uint8)
-
-print(predictions)
 np.savez("res_data.npz", M=M, H=H, predictions=predictions)
 
-plt.figure()
-plt.imshow(data[0][1], aspect='auto', origin='lower')
-plt.colorbar()
-plt.title("Activation matrix W")
-plt.xlabel("Time frames")
-plt.ylabel("Pitch / Component index")
-plt.show()
-
-print(binary_piano_roll[58,:])
-
-print(H[:88,5:10].shape)
-
-data[0][0].shape
-
-print(len(train_tracks))

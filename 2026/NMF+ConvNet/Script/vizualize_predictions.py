@@ -115,6 +115,47 @@ def evaluate_results(H_et,H):
   F1 = 2 * P * R / (P + R)
   return (P,R,F1)
 
+def find_best_threshold(y_true, probabilities):
+
+    thresholds = np.arange(
+        0.05, 0.96, 0.01
+    )
+
+    best_f1 = -1.0
+    best_threshold = 0.5
+
+    for threshold in thresholds:
+
+        predictions = (
+            probabilities >= threshold
+        ).astype(np.uint8)
+
+        tp = np.sum(
+            (y_true == 1) & (predictions == 1)
+        )
+
+        fp = np.sum(
+            (y_true == 0) & (predictions == 1)
+        )
+
+        fn = np.sum(
+            (y_true == 1) & (predictions == 0)
+        )
+
+        precision = tp / max(tp + fp, 1)
+        recall = tp / max(tp + fn, 1)
+
+        f1 = (
+            2 * precision * recall /
+            max(precision + recall, 1e-10)
+        )
+
+        if f1 > best_f1:
+            best_f1 = f1
+            best_threshold = threshold
+
+    return best_threshold, best_f1
+
 # Load the trained model
 model = tf.keras.models.load_model("best_convnet.keras")
 data = np.load("res_data.npz",allow_pickle=True)
@@ -162,9 +203,11 @@ for i in range(2, H.shape[1] - 2):
 
 workflow = np.array(workflow)
 
-binary_piano_roll = (workflow >= 0.12).astype(np.uint8).T
-binary_piano_roll = postprocess_binary_piano_roll(binary_piano_roll, onsets, 12)
-binary_piano_roll = enforce_min_duration(binary_piano_roll,min_len=12)
+a = find_best_threshold(M[:,2:-2], workflow.T)
+
+binary_piano_roll = (workflow >= a[0]).astype(np.uint8).T
+#binary_piano_roll = postprocess_binary_piano_roll(binary_piano_roll, onsets, 12)
+#binary_piano_roll = enforce_min_duration(binary_piano_roll,min_len=12)
 
 import matplotlib.pyplot as plt
 plt.figure()
