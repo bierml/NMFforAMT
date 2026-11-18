@@ -778,6 +778,7 @@ def build_W_from_data(nof_vectors=50, add_vectors=10):
     W_f = compute_columns_list(W_n)
     R = merge_matrices(R, W_f)
     R = fill_zero_columns(R, K)
+    R = R / R.sum(axis=0)
     del x, f_s, S, M, W, H, history, W_n, W_f
     gc.collect()
     if(len(get_nonzero_rows_indices(R.T))>nof_vectors):
@@ -798,5 +799,3 @@ plt.title("Activity matrix W")
 plt.xlabel("Time frames")
 plt.ylabel("Pitch / Component index")
 plt.show()
-
-print(get_nonzero_rows_indices(res.T))
