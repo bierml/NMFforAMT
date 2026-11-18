@@ -572,15 +572,6 @@ def midi_to_cqt_labels(
 
     return B
 
-import matplotlib.pyplot as plt
-plt.figure()
-plt.imshow(M, aspect='auto', origin='lower')
-plt.colorbar()
-plt.title("Activation matrix W")
-plt.xlabel("Time frames")
-plt.ylabel("Pitch / Component index")
-plt.show()
-
 import librosa
 from scipy.io import wavfile
 K = 5
@@ -602,6 +593,15 @@ M = midi_to_cqt_labels("Prelude-in-E-Minor-Nr-4.mid", spectrogram.shape[1], 4410
 #spectrogram = norm_log(spectrogram, g)
 #spectrogram = librosa.util.normalize(spectrogram, norm = 2, axis = 0, threshold = 0.05)
 
+import matplotlib.pyplot as plt
+plt.figure()
+plt.imshow(M, aspect='auto', origin='lower')
+plt.colorbar()
+plt.title("Activation matrix W")
+plt.xlabel("Time frames")
+plt.ylabel("Pitch / Component index")
+plt.show()
+
 print(spectrogram.shape)
 
 W, H, history = kl_residual_nmf(
@@ -609,7 +609,7 @@ W, H, history = kl_residual_nmf(
     H_init=M,
     update="W",
     normalize_W=False,
-    max_iter=500,
+    max_iter=200,
     tol=1e-6,
     verbose=True,
 )
@@ -632,28 +632,28 @@ def nonzero_row_indices(matrix):
     return np.flatnonzero(np.any(matrix != 0, axis=1))
 print(nonzero_row_indices(M), len(nonzero_row_indices(M)))
 
+import os
+import psutil
+
+process = psutil.Process(os.getpid())
+
+def print_memory(stage):
+    mem = process.memory_info().rss / (1024**3)
+    print(f"[{stage}] RAM usage: {mem:.2f} GB")
+
 from pathlib import Path
+import gc
 
 def get_files(extension):
     return [str(file) for file in Path.cwd().rglob("*."+extension)]
 def merge_matrices(A, B):
-    """
-    Merge two matrices column-wise:
-    - Both columns zero  -> zero column.
-    - Only A nonzero     -> take A column.
-    - Only B nonzero     -> take B column.
-    - Both nonzero       -> take A column.
-    """
-    A = np.asarray(A)
-    B = np.asarray(B)
-
     if A.shape != B.shape:
         raise ValueError("Matrices must have the same shape.")
 
-    mask_A = np.any(A != 0, axis=0)
-    mask_B = np.any(B != 0, axis=0)
+    mask = ~np.any(A != 0, axis=0)
+    A[:, mask] = B[:, mask]
 
-    return np.where(mask_A[np.newaxis, :], A, B)
+    return A
 def compute_columns_list(W_n, t=0.05):
   W_o = np.zeros(W_n.shape)
   l = []
@@ -663,47 +663,132 @@ def compute_columns_list(W_n, t=0.05):
     end = 88*K-1 if (i*K+K//2 >= 88*K-1) else i*K+K//2
     for k in range(start,end+1):
       s += W_n[k,i]
-    #print(s)
     if(s>t):
-      #l.append(i)
       W_o[:,i] = W_n[:,i]
-      #for m in range(88*K):
-        #W_o[m,i] = W_n[m,i]
-        #W_o[:,i] = W_n[:,i]
-  #return l
   return W_o
-def build_W_from_data():
+
+def get_nonzero_rows_indices(A):
+    A = np.asarray(A)
+    return np.where(np.any(A != 0, axis=1))[0]
+
+def fill_zero_columns(R, K, copy=True):
+    """
+    Fill zero columns using the nearest nonzero columns.
+
+    A basis vector is shifted by multiples of K bins
+    according to the difference between source and target pitches.
+
+    Parameters
+    ----------
+    R : ndarray, shape (88*K, 88)
+        Dictionary matrix.
+    K : int
+        Number of CQT bins per semitone.
+    copy : bool
+        Whether to modify a copy of R.
+
+    Returns
+    -------
+    ndarray
+        Dictionary with all columns filled.
+    """
+
+    R = np.array(R, copy=copy)
+
+    n_bins, n_pitches = R.shape
+
+    valid = np.where(np.any(R != 0, axis=0))[0]
+    missing = np.where(~np.any(R != 0, axis=0))[0]
+
+    if len(valid) == 0:
+        raise ValueError("R contains no nonzero columns.")
+
+    for pitch in missing:
+
+        # Find nearest available pitch
+        nearest = valid[np.argmin(np.abs(valid - pitch))]
+
+        # Shift the basis vector
+        shift = (pitch - nearest) * K
+
+        source = R[:, nearest]
+
+        R[:, pitch] = np.roll(source, shift)
+
+        # Remove wrapped-around values
+        if shift > 0:
+            R[:shift, pitch] = 0
+
+        elif shift < 0:
+            R[shift:, pitch] = 0
+
+    return R
+
+
+def build_W_from_data(nof_vectors=50, add_vectors=10):
   l = get_files("wav")
   r = get_files("mid")
   R = np.zeros((88*K,88))
   for m in l.copy():
     if(not m[:-3]+"mid" in r):
       l.remove(m)
+  l.remove("/content/Prelude-in-E-Minor-Nr-4.wav")
   for file_name_string_audio in l:
     f_s, x = wavfile.read(file_name_string_audio)
-    if(x.dtype==np.int32):
-      x = x / (2**31)
-    elif(x.dtype==np.int16):
-      x = x / (2**15)
+    # Normalize audio
+    if x.dtype == np.int32:
+        x = x.astype(np.float32) / (2**31)
+
+    elif x.dtype == np.int16:
+        x = x.astype(np.float32) / (2**15)
+
+    elif x.dtype == np.uint8:
+        x = (x.astype(np.float32) - 128) / 128
+
+    elif x.dtype == np.float32:
+        x = x.copy()
+
+    elif x.dtype == np.float64:
+        x = x.astype(np.float32)
+
     else:
-      raise ValueError(f"Unsupported sample type: {x.dtype}")
+        raise ValueError(f"Unsupported sample type: {x.dtype}")
+
+    # Convert multichannel audio to mono
+    if x.ndim > 1:
+        x = np.mean(x, axis=1, dtype=np.float32)
+    print("New iteration, number of nonzero R columns: ", len(get_nonzero_rows_indices(R.T)))
     S = np.abs(librosa.cqt(x,sr=f_s, fmin=librosa.note_to_hz('A0'), bins_per_octave=12 * K, n_bins=88 * K+L, hop_length=HOP, sparsity=0.05))
-    M = midi_to_cqt_labels("Prelude-in-E-Minor-Nr-4.mid", S.shape[1], 44100, HOP, mode="normalized")
+    M = midi_to_cqt_labels(file_name_string_audio[:-3]+"mid", S.shape[1], f_s, HOP, mode="normalized")
+    if(len(set(get_nonzero_rows_indices(M))-set(get_nonzero_rows_indices(R.T)))<add_vectors):
+      del S, M
+      gc.collect()
+      print("Skipped iteration: less new columns than add_vectors")
+      continue
     W, H, history = kl_residual_nmf(
     S,
     H_init=M,
     update="W",
     normalize_W=False,
-    max_iter=500,
+    max_iter=200,
     tol=1e-6,
     verbose=False,
     )
     W_n = W / W.sum(axis=0)
     W_f = compute_columns_list(W_n)
     R = merge_matrices(R, W_f)
+    R = fill_zero_columns(R, K)
+    del x, f_s, S, M, W, H, history, W_n, W_f
+    gc.collect()
+    if(len(get_nonzero_rows_indices(R.T))>nof_vectors):
+      print("Finished: number of vectors bigger than nof_vectors found")
+      R = fill_zero_columns(R, K)
+      break
   return R
 
 res = build_W_from_data()
+
+np.save("res.npy", res)
 
 import matplotlib.pyplot as plt
 plt.figure()
@@ -713,3 +798,5 @@ plt.title("Activity matrix W")
 plt.xlabel("Time frames")
 plt.ylabel("Pitch / Component index")
 plt.show()
+
+print(get_nonzero_rows_indices(res.T))
