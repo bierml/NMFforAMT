@@ -632,15 +632,6 @@ def nonzero_row_indices(matrix):
     return np.flatnonzero(np.any(matrix != 0, axis=1))
 print(nonzero_row_indices(M), len(nonzero_row_indices(M)))
 
-import os
-import psutil
-
-process = psutil.Process(os.getpid())
-
-def print_memory(stage):
-    mem = process.memory_info().rss / (1024**3)
-    print(f"[{stage}] RAM usage: {mem:.2f} GB")
-
 from pathlib import Path
 import gc
 
@@ -673,57 +664,81 @@ def get_nonzero_rows_indices(A):
 
 def fill_zero_columns(R, K, copy=True):
     """
-    Fill zero columns using the nearest nonzero columns.
+    Fill zero columns of an 88-pitch CQT dictionary using the nearest
+    original nonzero column.
 
-    A basis vector is shifted by multiples of K bins
-    according to the difference between source and target pitches.
+    Below the fundamental:
+        Copy bins without shifting their frequency positions.
+        Pad with zeros or truncate as necessary.
+
+    At and above the fundamental:
+        Shift the spectrum to align the source fundamental with
+        the target fundamental.
 
     Parameters
     ----------
-    R : ndarray, shape (88*K, 88)
-        Dictionary matrix.
+    R : ndarray, shape (n_bins, n_pitches)
+        CQT dictionary.
     K : int
         Number of CQT bins per semitone.
     copy : bool
-        Whether to modify a copy of R.
+        If True, leave the input matrix unchanged.
+    normalize : bool
+        If True, L1-normalize the filled columns.
 
     Returns
     -------
-    ndarray
-        Dictionary with all columns filled.
+    R_filled : ndarray
+        Dictionary with zero columns approximated.
     """
+    R = np.asarray(R)
+    if R.ndim != 2:
+        raise ValueError("R must be a 2D matrix.")
+    if not isinstance(K, (int, np.integer)) or K <= 0:
+        raise ValueError("K must be a positive integer.")
 
-    R = np.array(R, copy=copy)
+    R_filled = R.copy() if copy else R
 
-    n_bins, n_pitches = R.shape
+    n_bins, n_pitches = R_filled.shape
 
-    valid = np.where(np.any(R != 0, axis=0))[0]
-    missing = np.where(~np.any(R != 0, axis=0))[0]
+    valid = np.flatnonzero(np.any(R_filled != 0, axis=0))
+    missing = np.flatnonzero(~np.any(R_filled != 0, axis=0))
 
-    if len(valid) == 0:
+    if valid.size == 0:
         raise ValueError("R contains no nonzero columns.")
 
-    for pitch in missing:
+    for target in missing:
+        # Select the nearest ORIGINAL nonzero pitch column.
+        source = valid[np.argmin(np.abs(valid - target))]
 
-        # Find nearest available pitch
-        nearest = valid[np.argmin(np.abs(valid - pitch))]
+        # Fundamental-frequency bin indices.
+        old_f0 = source * K
+        new_f0 = target * K
 
-        # Shift the basis vector
-        shift = (pitch - nearest) * K
+        source_vector = R_filled[:, source]
+        target_vector = np.zeros(n_bins, dtype=R_filled.dtype)
 
-        source = R[:, nearest]
+        # --------------------------------------------------
+        # 1. Below the fundamental: do not shift frequencies.
+        # --------------------------------------------------
+        lower_length = min(old_f0, new_f0, n_bins)
 
-        R[:, pitch] = np.roll(source, shift)
+        target_vector[:lower_length] = source_vector[:lower_length]
 
-        # Remove wrapped-around values
-        if shift > 0:
-            R[:shift, pitch] = 0
+        # --------------------------------------------------
+        # 2. At and above the fundamental: align fundamentals.
+        # --------------------------------------------------
+        upper_length = min(
+            n_bins - old_f0,
+            n_bins - new_f0
+        )
 
-        elif shift < 0:
-            R[shift:, pitch] = 0
-
-    return R
-
+        if upper_length > 0:
+            target_vector[new_f0:new_f0 + upper_length] = (
+                source_vector[old_f0:old_f0 + upper_length]
+            )
+        R_filled[:, target] = target_vector
+    return R_filled
 
 def build_W_from_data(nof_vectors=50, add_vectors=10):
   l = get_files("wav")
@@ -777,14 +792,13 @@ def build_W_from_data(nof_vectors=50, add_vectors=10):
     W_n = W / W.sum(axis=0)
     W_f = compute_columns_list(W_n)
     R = merge_matrices(R, W_f)
-    R = fill_zero_columns(R, K)
-    R = R / R.sum(axis=0)
     del x, f_s, S, M, W, H, history, W_n, W_f
     gc.collect()
     if(len(get_nonzero_rows_indices(R.T))>nof_vectors):
       print("Finished: number of vectors bigger than nof_vectors found")
-      R = fill_zero_columns(R, K)
       break
+  R = fill_zero_columns(R, K)
+  R = R / R.sum(axis=0)
   return R
 
 res = build_W_from_data()
