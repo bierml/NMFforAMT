@@ -30,1364 +30,478 @@ K = 5
 L = 0
 g = 3
 HOP = 2048
-"""HNMA / regularized non-negative matrix factorization.
 
-Factorization:
-    X ~= W @ H
-
-X: (frequency_bins, frames)
-W: (frequency_bins, components)
-H: (components, frames)
-
-In the paper's notation W corresponds to A and H to S.
-
-Regularizers
-------------
-alpha(W or H):
-    lambda_alpha * sum(Z**p)
-
-beta(H):
-    beta1 / 'sparsity':
-        mu * sum(H**p)
-
-    beta2 / 'cross_correlation':
-        mu * sum(H * (C @ H))
-
-    beta3 / 'temporal_smoothness':
-        -mu * sum((H @ V) * H)
-
-For beta3, beta3_exponential=True replaces beta3 by exp(beta3).
-
-The basis shift-similarity term from the earlier implementation
-is retained.
-
-Dependencies: NumPy only.
-"""
-
-class HNMA:
-    """Regularized non-negative matrix factorization."""
-
-    def __init__(
-        self,
-        n_components: Optional[int] = None,
-
-        # Alpha: generalized sparsity.
-        lambda_alpha: float = 0.0,
-        alpha_target: Literal['H', 'W'] = 'H',
-        alpha_measure: Literal['l1', 'l2', 'lp', 'none'] = 'l1',
-        alpha_power: float = 1.0,
-
-        # Beta: additional regularization.
-        beta_mode: Literal[
-            'none',
-            'sparsity',
-            'cross_correlation',
-            'temporal_smoothness',
-            'beta1',
-            'beta2',
-            'beta3'
-        ] = 'none',
-
-        lambda_beta: float = 0.0,
-        beta_power: float = 1.0,
-
-        beta_weights: Optional[ArrayLike] = None,
-        beta_interval_weights: Optional[Mapping[int, float]] = None,
-        pitch_numbers: Optional[Sequence[int]] = None,
-
-        temporal_weights: Optional[ArrayLike] = None,
-        temporal_lags: Optional[Mapping[int, float]] = None,
-        temporal_circular: bool = False,
-        beta3_exponential: bool = False,
-
-        # Legacy options.
-        lambda_h: float = 0.0,
-        lambda_shift: float = 0.0,
-
-        sparsity_measure: Literal[
-            'l1', 'none', 'l2', 'lp'
-        ] = 'l1',
-
-        sparsity_power: float = 1.0,
-
-        bins_per_octave: int = 36,
-        shift_bins: Optional[int] = None,
-
-        normalize_W: bool = True,
-
-        max_iter: int = 300,
-        tol: float = 1e-5,
-        min_iter: int = 10,
-        patience: int = 5,
-        epsilon: float = 1e-10,
-
-        random_state: Optional[int] = None,
-        verbose: bool = False,
-        eval_every: int = 1,
-    ):
-
-        if n_components is not None and n_components <= 0:
-            raise ValueError(
-                'n_components must be positive or None.'
-            )
-
-        for name, value in (
-            ('lambda_alpha', lambda_alpha),
-            ('lambda_beta', lambda_beta),
-            ('lambda_h', lambda_h),
-            ('lambda_shift', lambda_shift),
-        ):
-            if value < 0:
-                raise ValueError(
-                    f'{name} must be non-negative.'
-                )
-
-        if alpha_target not in {'H', 'W'}:
-            raise ValueError(
-                "alpha_target must be 'H' or 'W'."
-            )
-
-        if alpha_measure not in {
-            'l1', 'l2', 'lp', 'none'
-        }:
-            raise ValueError(
-                "alpha_measure must be 'l1', 'l2', 'lp', or 'none'."
-            )
-
-        if alpha_power <= 0:
-            raise ValueError(
-                'alpha_power must be positive.'
-            )
-
-        if sparsity_measure not in {
-            'l1', 'l2', 'lp', 'none'
-        }:
-            raise ValueError(
-                "sparsity_measure must be 'l1', 'l2', 'lp', or 'none'."
-            )
-
-        if sparsity_power <= 0:
-            raise ValueError(
-                'sparsity_power must be positive.'
-            )
-
-        if beta_power <= 0:
-            raise ValueError(
-                'beta_power must be positive.'
-            )
-
-        beta_aliases = {
-            'beta1': 'sparsity',
-            'beta2': 'cross_correlation',
-            'beta3': 'temporal_smoothness',
-            'smoothness': 'temporal_smoothness',
-            'cross-correlation': 'cross_correlation',
-            'temporal': 'temporal_smoothness',
-        }
-
-        beta_mode = beta_aliases.get(
-            beta_mode, beta_mode
-        )
-
-        if beta_mode not in {
-            'none',
-            'sparsity',
-            'cross_correlation',
-            'temporal_smoothness'
-        }:
-            raise ValueError(
-                "beta_mode must be 'none', 'sparsity'/'beta1', "
-                "'cross_correlation'/'beta2', or "
-                "'temporal_smoothness'/'beta3'."
-            )
-
-        if sparsity_measure == 'none':
-            lambda_h = 0.0
-
-        if alpha_measure == 'none':
-            lambda_alpha = 0.0
-
-        if bins_per_octave <= 0:
-            raise ValueError(
-                'bins_per_octave must be positive.'
-            )
-
-        if shift_bins is None:
-            if bins_per_octave % 12 != 0:
-                raise ValueError(
-                    'bins_per_octave must be divisible by 12, '
-                    'or set shift_bins explicitly.'
-                )
-
-            shift_bins = bins_per_octave // 12
-
-        if shift_bins <= 0:
-            raise ValueError(
-                'shift_bins must be positive.'
-            )
-
-        if (
-            max_iter <= 0
-            or min_iter < 0
-            or patience <= 0
-            or eval_every <= 0
-        ):
-            raise ValueError(
-                'Invalid iteration/convergence settings.'
-            )
-
-        if tol < 0 or epsilon <= 0:
-            raise ValueError(
-                'tol must be nonnegative and epsilon positive.'
-            )
-
-        if (
-            beta_weights is not None
-            and beta_interval_weights is not None
-        ):
-            raise ValueError(
-                'Specify beta_weights or beta_interval_weights, not both.'
-            )
-
-        if (
-            temporal_weights is not None
-            and temporal_lags is not None
-        ):
-            raise ValueError(
-                'Specify temporal_weights or temporal_lags, not both.'
-            )
-
-        if (
-            beta_mode == 'temporal_smoothness'
-            and lambda_beta
-            and not beta3_exponential
-        ):
-            warnings.warn(
-                'Raw beta3 is a negative quadratic regularizer and '
-                'can make the objective unbounded below for sufficiently '
-                'large lambda_beta. Consider beta3_exponential=True '
-                'and validate the result.',
-                RuntimeWarning,
-            )
-
-        # Store parameters.
-
-        self.n_components = n_components
-
-        self.lambda_alpha = float(lambda_alpha)
-        self.alpha_target = alpha_target
-        self.alpha_measure = alpha_measure
-        self.alpha_power = float(alpha_power)
-
-        self.beta_mode = beta_mode
-        self.lambda_beta = float(lambda_beta)
-        self.beta_power = float(beta_power)
-
-        self.beta_weights = (
-            None if beta_weights is None
-            else np.asarray(beta_weights, dtype=np.float64)
-        )
-
-        self.beta_interval_weights = (
-            None if beta_interval_weights is None
-            else dict(beta_interval_weights)
-        )
-
-        self.pitch_numbers = (
-            None if pitch_numbers is None
-            else np.asarray(pitch_numbers, dtype=int)
-        )
-
-        self.temporal_weights = (
-            None if temporal_weights is None
-            else np.asarray(temporal_weights, dtype=np.float64)
-        )
-
-        self.temporal_lags = (
-            {1: 1.0} if temporal_lags is None
-            else dict(temporal_lags)
-        )
-
-        self.temporal_circular = bool(temporal_circular)
-        self.beta3_exponential = bool(beta3_exponential)
-
-        # Legacy options.
-
-        self.lambda_h = float(lambda_h)
-        self.lambda_shift = float(lambda_shift)
-
-        self.sparsity_measure = sparsity_measure
-        self.sparsity_power = float(sparsity_power)
-
-        self.bins_per_octave = int(bins_per_octave)
-        self.shift_bins = int(shift_bins)
-
-        self.normalize_W = bool(normalize_W)
-
-        self.max_iter = int(max_iter)
-        self.tol = float(tol)
-        self.min_iter = int(min_iter)
-        self.patience = int(patience)
-        self.epsilon = float(epsilon)
-
-        self.random_state = random_state
-        self.verbose = bool(verbose)
-        self.eval_every = int(eval_every)
-
-        # Fitted attributes.
-
-        self.components_ = None
-        self.activations_ = None
-        self.reconstruction_ = None
-
-        self.objective_history_ = []
-        self.alpha_history_ = []
-        self.beta_history_ = []
-
-        self.n_iter_ = 0
-        self.n_features_in_ = None
-        self.n_frames_in_ = None
-        self.converged_ = False
-
-        self.cross_correlation_weights_ = None
-        self.temporal_weights_ = None
-
-        if (
-            self.lambda_alpha > 0
-            and self.alpha_target == 'W'
-            and self.alpha_measure == 'l1'
-            and self.normalize_W
-        ):
-            warnings.warn(
-                "alpha_target='W' with L1 sparsity and normalize_W=True "
-                "is a constant penalty (each W column sums to one). "
-                "Use alpha_power between 0 and 1 with "
-                "alpha_measure='lp', or disable normalization.",
-                RuntimeWarning,
-            )
-
-    # ---------------------------------------------------------
-    # Validation and initialization
-    # ---------------------------------------------------------
-
-    def _validate_X(self, X: ArrayLike) -> np.ndarray:
-
-        X = np.asarray(X, dtype=np.float64)
-
-        if X.ndim != 2 or min(X.shape) == 0:
-            raise ValueError(
-                'X must be a non-empty 2D (frequency, time) matrix.'
-            )
-
-        if not np.all(np.isfinite(X)):
-            raise ValueError(
-                'X contains NaN or infinite values.'
-            )
-
-        if np.any(X < 0):
-            raise ValueError(
-                'NMF requires X >= 0.'
-            )
-
-        return X
-
-    def _infer_rank(self, W_init, H_init):
-
-        inferred = []
-
-        if W_init is not None:
-            w = np.asarray(W_init)
-
-            if w.ndim != 2:
-                raise ValueError(
-                    'W_init must be 2D (frequency, components).'
-                )
-
-            inferred.append(w.shape[1])
-
-        if H_init is not None:
-            h = np.asarray(H_init)
-
-            if h.ndim != 2:
-                raise ValueError(
-                    'H_init must be 2D (components, time).'
-                )
-
-            inferred.append(h.shape[0])
-
-        if inferred and any(k != inferred[0] for k in inferred):
-            raise ValueError(
-                'W_init and H_init disagree on the component count.'
-            )
-
-        if (
-            self.n_components is not None
-            and inferred
-            and self.n_components != inferred[0]
-        ):
-            raise ValueError(
-                'n_components does not match W_init/H_init.'
-            )
-
-        if self.n_components is not None:
-            return int(self.n_components)
-
-        if inferred:
-            return int(inferred[0])
-
-        raise ValueError(
-            'Set n_components or provide W_init/H_init.'
-        )
-
-    def _normalize_columns(self, W, H=None):
-
-        sums = np.maximum(
-            np.sum(W, axis=0),
-            self.epsilon
-        )
-
-        W /= sums[None, :]
-
-        if H is not None:
-            H *= sums[:, None]
-
-        return W, H
-
-    def _initialize(self, X, W_init, H_init):
-
-        F, T = X.shape
-        K = self._infer_rank(W_init, H_init)
-
-        rng = np.random.default_rng(self.random_state)
-
-        if W_init is not None:
-
-            W = np.asarray(
-                W_init, dtype=np.float64
-            ).copy()
-
-            if (
-                W.shape != (F, K)
-                or not np.all(np.isfinite(W))
-                or np.any(W < 0)
-            ):
-                raise ValueError(
-                    f'W_init must be finite, nonnegative, '
-                    f'and shaped {(F, K)}.'
-                )
-
-            W = np.maximum(W, self.epsilon)
-
-        else:
-            W = rng.random((F, K)) + 0.1
-
-        if H_init is not None:
-
-            H = np.asarray(
-                H_init, dtype=np.float64
-            ).copy()
-
-            if (
-                H.shape != (K, T)
-                or not np.all(np.isfinite(H))
-                or np.any(H < 0)
-            ):
-                raise ValueError(
-                    f'H_init must be finite, nonnegative, '
-                    f'and shaped {(K, T)}.'
-                )
-
-            H = np.maximum(H, self.epsilon)
-
-        else:
-            H = None
-
-        if self.normalize_W:
-            W, H = self._normalize_columns(W, H)
-
-        if H is None:
-
-            H = np.maximum(
-                W.T @ X,
-                self.epsilon
-            )
-
-            H *= (
-                (W.T @ X + self.epsilon)
-                / (W.T @ W @ H + self.epsilon)
-            )
-
-            H = np.maximum(H, self.epsilon)
-
-        return W, H
-
-    # ---------------------------------------------------------
-    # Basis shift-similarity regularization
-    # ---------------------------------------------------------
-
-    def _shifted_down_right(self, W):
-
-        q = self.shift_bins
-
-        shifted = np.zeros_like(W)
-
-        if q < W.shape[0] and W.shape[1] > 1:
-            shifted[q:, 1:] = W[:-q, :-1]
-
-        return shifted
-
-    def _shift_gradient(self, W):
-
-        if self.lambda_shift == 0:
-            return np.zeros_like(W)
-
-        D = W - self._shifted_down_right(W)
-
-        adjoint = np.zeros_like(D)
-
-        q = self.shift_bins
-
-        if q < W.shape[0] and W.shape[1] > 1:
-            adjoint[:-q, :-1] = D[q:, 1:]
-
-        return 2.0 * self.lambda_shift * (D - adjoint)
-
-    # ---------------------------------------------------------
-    # Alpha: generalized sparsity
-    # ---------------------------------------------------------
-
-    @staticmethod
-    def _power_from_measure(measure, power):
-
-        if measure == 'none':
-            return None
-
-        if measure == 'l1':
-            return 1.0
-
-        if measure == 'l2':
-            return 2.0
-
-        return float(power)
-
-    def _alpha_power(self):
-
-        return self._power_from_measure(
-            self.alpha_measure,
-            self.alpha_power
-        )
-
-    def _legacy_h_power(self):
-
-        return self._power_from_measure(
-            self.sparsity_measure,
-            self.sparsity_power
-        )
-
-    def _alpha_objective(self, W, H):
-
-        p = self._alpha_power()
-
-        if self.lambda_alpha == 0 or p is None:
-            return 0.0
-
-        Z = W if self.alpha_target == 'W' else H
-
-        return self.lambda_alpha * float(
-            np.sum(np.maximum(Z, 0.0) ** p)
-        )
-
-    def _alpha_gradient(self, W, H):
-
-        gW = np.zeros_like(W)
-        gH = np.zeros_like(H)
-
-        p = self._alpha_power()
-
-        if self.lambda_alpha == 0 or p is None:
-            return gW, gH
-
-        if self.alpha_target == 'W':
-
-            gW = (
-                self.lambda_alpha
-                * p
-                * np.maximum(W, self.epsilon) ** (p - 1.0)
-            )
-
-        else:
-
-            gH = (
-                self.lambda_alpha
-                * p
-                * np.maximum(H, self.epsilon) ** (p - 1.0)
-            )
-
-        return gW, gH
-
-    # ---------------------------------------------------------
-    # Beta: cross-correlation weights
-    # ---------------------------------------------------------
-
-    def _build_cross_correlation_weights(self, K):
-
-        if self.beta_weights is not None:
-
-            C = np.asarray(
-                self.beta_weights,
-                dtype=np.float64
-            ).copy()
-
-            if C.shape != (K, K):
-                raise ValueError(
-                    f'beta_weights must have shape {(K, K)}.'
-                )
-
-            if (
-                not np.all(np.isfinite(C))
-                or np.any(C < 0)
-            ):
-                raise ValueError(
-                    'beta_weights must be finite and nonnegative.'
-                )
-
-            C = 0.5 * (C + C.T)
-
-        elif self.beta_interval_weights is not None:
-
-            if self.pitch_numbers is None:
-                pitches = np.arange(21, 21 + K)
-
-            else:
-                pitches = self.pitch_numbers
-
-                if pitches.shape != (K,):
-                    raise ValueError(
-                        f'pitch_numbers must contain {K} MIDI pitches.'
-                    )
-
-            interval_map = {}
-
-            for key, value in self.beta_interval_weights.items():
-
-                interval = int(key)
-
-                if interval < 0 or interval > 11:
-                    raise ValueError(
-                        'beta_interval_weights keys must be intervals 0..11.'
-                    )
-
-                value = float(value)
-
-                if value < 0 or not np.isfinite(value):
-                    raise ValueError(
-                        'Interval weights must be finite and nonnegative.'
-                    )
-
-                interval_map[interval] = value
-
-            C = np.zeros(
-                (K, K),
-                dtype=np.float64
-            )
-
-            for i in range(K):
-
-                for j in range(i + 1, K):
-
-                    d = int(
-                        (pitches[i] - pitches[j]) % 12
-                    )
-
-                    w = max(
-                        interval_map.get(d, 0.0),
-                        interval_map.get((-d) % 12, 0.0)
-                    )
-
-                    C[i, j] = C[j, i] = w
-
-        else:
-
-            C = (
-                np.ones((K, K), dtype=np.float64)
-                - np.eye(K)
-            )
-
-        np.fill_diagonal(C, 0.0)
-
-        return C
-
-    # ---------------------------------------------------------
-    # Beta: temporal weights
-    # ---------------------------------------------------------
-
-    def _build_temporal_weights(self, T):
-
-        V = np.asarray(
-            self.temporal_weights,
-            dtype=np.float64
-        ).copy()
-
-        if V.shape != (T, T):
-            raise ValueError(
-                f'temporal_weights must have shape {(T, T)}.'
-            )
-
-        if (
-            not np.all(np.isfinite(V))
-            or np.any(V < 0)
-        ):
-            raise ValueError(
-                'temporal_weights must be finite and nonnegative.'
-            )
-
-        V = 0.5 * (V + V.T)
-
-        np.fill_diagonal(V, 0.0)
-
-        return V
-
-    def _temporal_beta_and_gradient(self, H):
-
-        if self.temporal_weights_ is not None:
-
-            V = self.temporal_weights_
-
-            if V.shape != (H.shape[1], H.shape[1]):
-                raise ValueError(
-                    'Stored temporal_weights_ does not match H length.'
-                )
-
-            raw = -self.lambda_beta * float(
-                np.sum((H @ V) * H)
-            )
-
-            grad = -self.lambda_beta * (
-                H @ (V + V.T)
-            )
-
-            return raw, grad
-
-        T = H.shape[1]
-
-        raw = 0.0
-        grad = np.zeros_like(H)
-
-        for lag, weight in self.temporal_lags.items():
-
-            lag = int(lag)
-            weight = float(weight)
-
-            if lag <= 0:
-                raise ValueError(
-                    'temporal_lags must contain positive lags.'
-                )
-
-            if weight < 0 or not np.isfinite(weight):
-                raise ValueError(
-                    'Temporal lag weights must be finite and nonnegative.'
-                )
-
-            if lag >= T or weight == 0:
-                continue
-
-            # Symmetric V has entries:
-            # V[t, t+lag] = V[t+lag, t] = weight.
-
-            left = H[:, :-lag]
-            right = H[:, lag:]
-
-            coeff = 2.0 * self.lambda_beta * weight
-
-            raw -= coeff * float(
-                np.sum(left * right)
-            )
-
-            grad[:, :-lag] -= coeff * right
-            grad[:, lag:] -= coeff * left
-
-            if self.temporal_circular:
-
-                left_wrap = H[:, -lag:]
-                right_wrap = H[:, :lag]
-
-                raw -= coeff * float(
-                    np.sum(left_wrap * right_wrap)
-                )
-
-                grad[:, -lag:] -= coeff * right_wrap
-                grad[:, :lag] -= coeff * left_wrap
-
-        return raw, grad
-
-    # ---------------------------------------------------------
-    # Prepare beta regularization
-    # ---------------------------------------------------------
-
-    def _ensure_beta_weights(self, H):
-
-        if self.lambda_beta == 0 or self.beta_mode == 'none':
-
-            self.cross_correlation_weights_ = None
-            self.temporal_weights_ = None
-
-        elif self.beta_mode == 'cross_correlation':
-
-            self.cross_correlation_weights_ = (
-                self._build_cross_correlation_weights(
-                    H.shape[0]
-                )
-            )
-
-            self.temporal_weights_ = None
-
-        elif self.beta_mode == 'temporal_smoothness':
-
-            self.cross_correlation_weights_ = None
-
-            self.temporal_weights_ = (
-                self._build_temporal_weights(H.shape[1])
-                if self.temporal_weights is not None
-                else None
-            )
-
-            for lag, weight in self.temporal_lags.items():
-
-                if (
-                    int(lag) <= 0
-                    or float(weight) < 0
-                    or not np.isfinite(float(weight))
-                ):
-                    raise ValueError(
-                        'temporal_lags must map positive lags '
-                        'to finite nonnegative weights.'
-                    )
-
-        else:
-
-            self.cross_correlation_weights_ = None
-            self.temporal_weights_ = None
-
-    # ---------------------------------------------------------
-    # Beta: objective
-    # ---------------------------------------------------------
-
-    def _beta_objective(self, H):
-
-        if self.lambda_beta == 0 or self.beta_mode == 'none':
-            return 0.0
-
-        if self.beta_mode == 'sparsity':
-
-            return self.lambda_beta * float(
-                np.sum(
-                    np.maximum(H, 0.0) ** self.beta_power
-                )
-            )
-
-        if self.beta_mode == 'cross_correlation':
-
-            C = self.cross_correlation_weights_
-
-            if C is None or C.shape != (H.shape[0], H.shape[0]):
-                C = self._build_cross_correlation_weights(
-                    H.shape[0]
-                )
-
-            return self.lambda_beta * float(
-                np.sum(H * (C @ H))
-            )
-
-        if self.beta_mode == 'temporal_smoothness':
-
-            raw_beta3, _ = self._temporal_beta_and_gradient(H)
-
-            if self.beta3_exponential:
-
-                return float(
-                    np.exp(
-                        np.clip(raw_beta3, -700.0, 0.0)
-                    )
-                )
-
-            return raw_beta3
-
-        raise RuntimeError(
-            'Unexpected beta_mode.'
-        )
-
-    # ---------------------------------------------------------
-    # Beta: gradient
-    # ---------------------------------------------------------
-
-    def _beta_gradient(self, H):
-
-        if self.lambda_beta == 0 or self.beta_mode == 'none':
-            return np.zeros_like(H)
-
-        if self.beta_mode == 'sparsity':
-
-            return (
-                self.lambda_beta
-                * self.beta_power
-                * np.maximum(H, self.epsilon) ** (
-                    self.beta_power - 1.0
-                )
-            )
-
-        if self.beta_mode == 'cross_correlation':
-
-            C = self.cross_correlation_weights_
-
-            if C is None or C.shape != (H.shape[0], H.shape[0]):
-                C = self._build_cross_correlation_weights(
-                    H.shape[0]
-                )
-
-            return self.lambda_beta * (
-                (C + C.T) @ H
-            )
-
-        if self.beta_mode == 'temporal_smoothness':
-
-            raw_beta3, grad = (
-                self._temporal_beta_and_gradient(H)
-            )
-
-            if self.beta3_exponential:
-
-                grad *= float(
-                    np.exp(
-                        np.clip(raw_beta3, -700.0, 0.0)
-                    )
-                )
-
-            return grad
-
-        raise RuntimeError(
-            'Unexpected beta_mode.'
-        )
-
-    # ---------------------------------------------------------
-    # Objective and multiplicative-update helpers
-    # ---------------------------------------------------------
-
-    @staticmethod
-    def _positive_part(A):
-        return np.maximum(A, 0.0)
-
-    @staticmethod
-    def _negative_part(A):
-        return np.maximum(-A, 0.0)
-
-    def _regularizer_gradient_W(self, W, H):
-
-        gW, _ = self._alpha_gradient(W, H)
-
-        return gW + self._shift_gradient(W)
-
-    def _regularizer_gradient_H(self, W, H):
-
-        _, gH = self._alpha_gradient(W, H)
-
-        p_legacy = self._legacy_h_power()
-
-        if self.lambda_h and p_legacy is not None:
-
-            gH = (
-                gH
-                + self.lambda_h
-                * p_legacy
-                * np.maximum(H, self.epsilon) ** (
-                    p_legacy - 1.0
-                )
-            )
-
-        return gH + self._beta_gradient(H)
-
-    def _objective(self, X, W, H):
-
-        R = X - W @ H
-
-        value = 0.5 * float(
-            np.sum(R * R)
-        )
-
-        value += self._alpha_objective(W, H)
-
-        p_legacy = self._legacy_h_power()
-
-        if self.lambda_h and p_legacy is not None:
-
-            value += self.lambda_h * float(
-                np.sum(
-                    np.maximum(H, 0.0) ** p_legacy
-                )
-            )
-
-        value += self._beta_objective(H)
-
-        if self.lambda_shift:
-
-            D = W - self._shifted_down_right(W)
-
-            value += self.lambda_shift * float(
-                np.sum(D * D)
-            )
-
-        return value
-
-    # ---------------------------------------------------------
-    # Fit
-    # ---------------------------------------------------------
-
-    def fit(
-        self,
-        X,
-        *,
-        W_init=None,
-        H_init=None,
-    ):
-
-        X = self._validate_X(X)
-
-        F, T = X.shape
-
-        W, H = self._initialize(
-            X,
-            W_init,
-            H_init
-        )
-
-        self._ensure_beta_weights(H)
-
-        self.objective_history_ = []
-        self.alpha_history_ = []
-        self.beta_history_ = []
-
-        small_change_count = 0
-        previous_obj = None
-
-        self.converged_ = False
-
-        for iteration in range(
-            1,
-            self.max_iter + 1
-        ):
-
-            # ---------------------------------------------
-            # Update H
-            # ---------------------------------------------
-
-            grad_H = self._regularizer_gradient_H(
-                W, H
-            )
-
-            num_H = (
-                W.T @ X
-                + self._negative_part(grad_H)
-            )
-
-            den_H = (
-                (W.T @ W) @ H
-                + self._positive_part(grad_H)
-                + self.epsilon
-            )
-
-            H *= (
-                (num_H + self.epsilon) / den_H
-            )
-
-            np.maximum(
-                H,
-                self.epsilon,
-                out=H
-            )
-
-            # ---------------------------------------------
-            # Update W
-            # ---------------------------------------------
-
-            grad_W = self._regularizer_gradient_W(
-                W, H
-            )
-
-            num_W = (
-                X @ H.T
-                + self._negative_part(grad_W)
-            )
-
-            den_W = (
-                W @ (H @ H.T)
-                + self._positive_part(grad_W)
-                + self.epsilon
-            )
-
-            W *= (
-                (num_W + self.epsilon) / den_W
-            )
-
-            np.maximum(
-                W,
-                self.epsilon,
-                out=W
-            )
-
-            # ---------------------------------------------
-            # Normalize basis columns
-            # ---------------------------------------------
-
-            if self.normalize_W:
-
-                W, H = self._normalize_columns(
-                    W, H
-                )
-
-            # ---------------------------------------------
-            # Evaluate objective
-            # ---------------------------------------------
-
-            if (
-                iteration % self.eval_every == 0
-                or iteration == self.max_iter
-            ):
-
-                obj = self._objective(
-                    X, W, H
-                )
-
-                self.objective_history_.append(obj)
-
-                self.alpha_history_.append(
-                    self._alpha_objective(W, H)
-                )
-
-                self.beta_history_.append(
-                    self._beta_objective(H)
-                )
-
-                rel_change = None
-
-                if previous_obj is not None:
-
-                    rel_change = (
-                        abs(previous_obj - obj)
-                        / max(
-                            abs(previous_obj),
-                            self.epsilon
-                        )
-                    )
-
-                    if rel_change < self.tol:
-                        small_change_count += 1
-                    else:
-                        small_change_count = 0
-
-                if self.verbose:
-
-                    change = (
-                        'n/a'
-                        if rel_change is None
-                        else f'{rel_change:.3e}'
-                    )
-
-                    print(
-                        f'HNMA iteration {iteration:4d}/'
-                        f'{self.max_iter}: '
-                        f'objective={obj:.8e}, '
-                        f'relative_change={change}'
-                    )
-
-                if (
-                    iteration >= self.min_iter
-                    and small_change_count >= self.patience
-                ):
-
-                    self.converged_ = True
-                    self.n_iter_ = iteration
-                    break
-
-                previous_obj = obj
-
-        else:
-
-            self.n_iter_ = self.max_iter
-
-        self.components_ = W
-        self.activations_ = H
-        self.reconstruction_ = W @ H
-
-        self.n_features_in_ = F
-        self.n_frames_in_ = T
-
-        return self
-
-    # ---------------------------------------------------------
-    # Fit transform
-    # ---------------------------------------------------------
-
-    def fit_transform(
-        self,
-        X,
-        *,
-        W_init=None,
-        H_init=None,
-    ):
-
-        self.fit(
-            X,
-            W_init=W_init,
-            H_init=H_init
-        )
-
-        return self.activations_.copy()
-
-    # ---------------------------------------------------------
-    # Transform with fixed W
-    # ---------------------------------------------------------
-
-    def transform(
-        self,
-        X,
-        *,
-        H_init=None,
-        max_iter=None,
-    ):
-        """
-        Infer H for new X with the learned W fixed.
-        Beta(H) remains active.
-        """
-
-        if self.components_ is None:
-            raise RuntimeError(
-                'Call fit before transform.'
-            )
-
-        X = self._validate_X(X)
-
-        W = self.components_
-
-        if X.shape[0] != W.shape[0]:
-            raise ValueError(
-                'X frequency dimension must match fitted W.'
-            )
-
-        K, T = W.shape[1], X.shape[1]
-
-        if H_init is not None:
-
-            H = np.asarray(
-                H_init,
-                dtype=np.float64
-            ).copy()
-
-            if (
-                H.shape != (K, T)
-                or not np.all(np.isfinite(H))
-                or np.any(H < 0)
-            ):
-                raise ValueError(
-                    f'H_init must be finite, nonnegative, '
-                    f'and shaped {(K, T)}.'
-                )
-
-            H = np.maximum(
-                H,
-                self.epsilon
-            )
-
-        else:
-
-            H = np.maximum(
-                W.T @ X,
-                self.epsilon
-            )
-
-        # Rebuild temporal weights for the new sequence length.
-
-        if (
-            self.beta_mode == 'temporal_smoothness'
-            and self.lambda_beta
-        ):
-
-            self.temporal_weights_ = (
-                self._build_temporal_weights(T)
-                if self.temporal_weights is not None
-                else None
-            )
-
-        steps = (
-            self.max_iter
-            if max_iter is None
-            else int(max_iter)
-        )
-
-        if steps <= 0:
-            raise ValueError(
-                'max_iter must be positive.'
-            )
-
-        WT_X = W.T @ X
-        WT_W = W.T @ W
-
-        for _ in range(steps):
-
-            grad_H = self._regularizer_gradient_H(
-                W, H
-            )
-
-            H *= (
-                WT_X + self._negative_part(grad_H)
-            ) / (
-                WT_W @ H
-                + self._positive_part(grad_H)
-                + self.epsilon
-            )
-
-            np.maximum(
-                H,
-                self.epsilon,
-                out=H
-            )
-
-        return H
-
-
-# -------------------------------------------------------------
-# Convenience function
-# -------------------------------------------------------------
-
-def hnma(
+def kl_residual_nmf(
     X,
     n_components=None,
     *,
     W_init=None,
     H_init=None,
-    **kwargs,
+    normalize_W=True,
+    update="both",
+    max_iter=300,
+    tol=1e-5,
+    eps=1e-10,
+    max_backtracking=40,
+    random_state=None,
+    verbose=False,
 ):
     """
-    Compatibility convenience function.
+    NMF minimizing the squared Frobenius norm of the element-wise
+    generalized KL-divergence residual.
 
-    Returns:
-        W, H, fitted_model
+    Objective
+    ---------
+        min 0.5 * ||X * log(X / (W @ H))
+                      - X + W @ H||_F^2
+
+    Subject to
+    ----------
+        W >= 0
+        H >= 0
+
+    Parameters
+    ----------
+    X : ndarray, shape (n_features, n_frames)
+        Nonnegative input matrix.
+
+    n_components : int, optional
+        Number of components. Can be inferred from initial matrices.
+
+    W_init : ndarray, optional
+        Initial basis matrix, shape (n_features, n_components).
+
+    H_init : ndarray, optional
+        Initial activation matrix, shape (n_components, n_frames).
+
+    update : {'both', 'W', 'H'}
+        'both': optimize W and H alternately.
+        'W': optimize W while keeping H fixed.
+        'H': optimize H while keeping W fixed.
+
+    max_iter : int
+        Maximum number of outer iterations.
+
+    tol : float
+        Relative objective-change stopping tolerance.
+
+    eps : float
+        Numerical stabilization constant. Also added to W @ H
+        when evaluating the divergence.
+
+    max_backtracking : int
+        Maximum line-search attempts per block update.
+
+    random_state : int, optional
+        Random seed.
+
+    verbose : bool
+        Print iteration information.
+
+    Returns
+    -------
+    W : ndarray
+        Learned basis matrix.
+
+    H : ndarray
+        Learned activation matrix.
+
+    history : list of dict
+        Objective, divergence and update information.
     """
+    def project_simplex_columns(A):
+        """
+        Euclidean projection of each column onto:
+            {x >= 0 : sum(x) = 1}
+        """
+        U = np.sort(A, axis=0)[::-1]
+        cssv = np.cumsum(U, axis=0) - 1.0
 
-    model = HNMA(
-        n_components=n_components,
-        **kwargs
+        indices = np.arange(1, A.shape[0] + 1)[:, None]
+
+        condition = U - cssv / indices > 0
+        rho = condition.sum(axis=0) - 1
+
+        theta = (
+            cssv[rho, np.arange(A.shape[1])]
+            / (rho + 1)
+        )
+
+        return np.maximum(A - theta[None, :], 0.0)
+    def evaluate(W, H, need_gradient=False):
+
+            Y = W @ H + eps
+
+            positive = X > 0
+
+            E = Y.copy()
+
+            # E = X * log(X/Y) - X + Y.
+            E[positive] = (
+                X[positive] * np.log(X[positive] / Y[positive])
+                - X[positive]
+                + Y[positive]
+            )
+
+            # Protect against tiny negative round-off errors.
+            np.maximum(E, 0.0, out=E)
+
+            objective = 0.5 * np.sum(E * E)
+
+            if not need_gradient:
+                return objective
+
+            # Gradient with respect to Y.
+            G = E * (1.0 - X / Y)
+
+            # Curvature with respect to Y.
+            curvature = (
+                (1.0 - X / Y) ** 2
+                + E * X / (Y * Y)
+            )
+
+            return objective, G, float(np.max(curvature))
+
+    # ---------------------------------------------------------
+    # Validation
+    # ---------------------------------------------------------
+    X = np.asarray(X, dtype=np.float64)
+
+    if X.ndim != 2 or min(X.shape) == 0:
+        raise ValueError("X must be a non-empty 2D matrix.")
+
+    if not np.all(np.isfinite(X)) or np.any(X < 0):
+        raise ValueError("X must be finite and nonnegative.")
+
+    if update not in {"both", "W", "H"}:
+        raise ValueError("update must be 'both', 'W', or 'H'.")
+
+    if max_iter < 1 or max_backtracking < 1:
+        raise ValueError("Iteration limits must be positive.")
+
+    if tol < 0 or eps <= 0:
+        raise ValueError("tol must be nonnegative and eps positive.")
+
+    F, T = X.shape
+
+    # ---------------------------------------------------------
+    # Infer rank
+    # ---------------------------------------------------------
+
+    inferred = []
+
+    if W_init is not None:
+        W_init = np.asarray(W_init, dtype=np.float64)
+
+        if W_init.ndim != 2:
+            raise ValueError("W_init must be 2D.")
+
+        inferred.append(W_init.shape[1])
+
+    if H_init is not None:
+        H_init = np.asarray(H_init, dtype=np.float64)
+
+        if H_init.ndim != 2:
+            raise ValueError("H_init must be 2D.")
+
+        inferred.append(H_init.shape[0])
+
+    if n_components is None:
+        if not inferred:
+            raise ValueError(
+                "Specify n_components or provide W_init/H_init."
+            )
+        n_components = inferred[0]
+
+    if not isinstance(n_components, (int, np.integer)) \
+            or n_components <= 0:
+        raise ValueError("n_components must be positive.")
+
+    K = int(n_components)
+
+    if any(k != K for k in inferred):
+        raise ValueError("Initialization matrices have incompatible ranks.")
+
+    rng = np.random.default_rng(random_state)
+
+    # ---------------------------------------------------------
+    # Initialize H first
+    # ---------------------------------------------------------
+
+    if H_init is not None:
+        H = np.asarray(H_init, dtype=np.float64).copy()
+
+        if H.ndim != 2 or not np.all(np.isfinite(H)):
+            raise ValueError("Invalid H_init.")
+
+        if np.any(H < 0):
+            raise ValueError("H_init must be nonnegative.")
+
+        if H.shape[1] != T:
+            raise ValueError("H_init has an incorrect number of frames.")
+
+        if n_components is not None and H.shape[0] != n_components:
+            raise ValueError("H_init has an incorrect component count.")
+
+        K = H.shape[0]
+    else:
+        if update == "W":
+            raise ValueError("H_init is required when update='W'.")
+
+        K = int(n_components)
+        H = rng.random((K, T)) + eps
+
+    # ---------------------------------------------------------
+    # Initialize W
+    # ---------------------------------------------------------
+
+    if W_init is not None:
+        W = np.asarray(W_init, dtype=np.float64).copy()
+
+        if W.shape != (F, K):
+            raise ValueError("W_init has an incorrect shape.")
+
+        if not np.all(np.isfinite(W)) or np.any(W < 0):
+            raise ValueError("W_init must be finite and nonnegative.")
+
+    elif update == "W":
+        # Ridge-regularized least-squares initialization:
+        #
+        # W = X H.T (H H.T + ridge I)^(-1)
+
+        HH = H @ H.T
+        XH = X @ H.T
+
+        ridge = 1e-8 * max(
+            np.trace(HH) / max(K, 1),
+            1.0
+        )
+
+        W = np.linalg.solve(
+            HH + ridge * np.eye(K),
+            XH.T
+        ).T
+
+        W = np.maximum(W, eps)
+
+    else:
+        W = rng.random((F, K)) + eps
+
+    # ---------------------------------------------------------
+    # Normalize W if requested
+    # ---------------------------------------------------------
+
+    if normalize_W and update in {"both", "W"}:
+
+        W_scale = W.sum(axis=0)
+
+        if np.any(W_scale <= eps):
+            raise ValueError("W contains zero columns.")
+
+        W /= W_scale[None, :]
+
+        # Preserve the initial reconstruction only if H is allowed
+        # to change.
+        if update == "both" and H_init is not None:
+            H *= W_scale[:, None]
+        # ---------------------------------------------------------
+        # Divergence and gradient
+        # ---------------------------------------------------------
+
+    # ---------------------------------------------------------
+    # Spectral norm squared of a Gram matrix
+    # ---------------------------------------------------------
+
+    def spectral_norm_squared(A):
+
+        if A.shape[0] == 0:
+            return eps
+
+        eigenvalues = np.linalg.eigvalsh(A)
+
+        return max(float(eigenvalues[-1]), eps)
+
+    # ---------------------------------------------------------
+    # Initialize block-specific step sizes
+    # ---------------------------------------------------------
+
+    initial_loss, G, curvature_max = evaluate(
+        W, H, need_gradient=True
     )
 
-    H = model.fit_transform(
-        X,
-        W_init=W_init,
-        H_init=H_init
-    )
+    def spectral_norm_squared(A):
+        return max(
+            float(np.linalg.eigvalsh(A)[-1]),
+            eps
+        )
 
-    return (
-        model.components_.copy(),
-        H,
-        model
-    )
+    L_W = spectral_norm_squared(H @ H.T)
+    L_H = spectral_norm_squared(W.T @ W)
+
+    # ---------------------------------------------------------
+    # Optimization helpers
+    # ---------------------------------------------------------
+
+    def update_block(variable, block):
+
+        nonlocal L_W, L_H
+
+        current_loss, G, curvature_max = evaluate(
+            W, H, need_gradient=True
+        )
+
+        if block == "W":
+
+            gradient = G @ H.T
+            gram = H @ H.T
+            L = L_W
+
+            old = variable
+
+        else:
+
+            gradient = W.T @ G
+            gram = W.T @ W
+            L = L_H
+
+            old = variable
+
+        # Improve initial Lipschitz estimate.
+        L = max(L, eps)
+        accepted = False
+        candidate_loss = current_loss
+
+        for bt in range(max_backtracking):
+
+            candidate = old - gradient / L
+
+            if normalize_W:
+                candidate = project_simplex_columns(candidate)
+            else:
+                candidate = np.maximum(candidate, 0.0)
+
+            delta = candidate - old
+
+            delta_norm_sq = np.sum(delta * delta)
+
+            if delta_norm_sq <= eps**2:
+                accepted = True
+                break
+
+            if block == "W":
+                candidate_loss = evaluate(candidate, H)
+            else:
+                candidate_loss = evaluate(W, candidate)
+
+            # Quadratic majorization condition.
+            upper_bound = (
+                current_loss
+                + np.sum(gradient * delta)
+                + 0.5 * L * delta_norm_sq
+            )
+
+            tolerance = 1e-12 * max(1.0, abs(current_loss))
+
+            if (
+                np.isfinite(candidate_loss)
+                and candidate_loss <= upper_bound + tolerance
+                and candidate_loss <= current_loss + tolerance
+            ):
+                accepted = True
+                break
+
+            L *= 2.0
+
+        if accepted:
+
+            # Store the accepted step size for the next iteration.
+            if block == "W":
+                L_W = L
+            else:
+                L_H = L
+
+            return candidate, True, L, float(candidate_loss)
+
+        return old, False, L, float(current_loss)
+
+    # ---------------------------------------------------------
+    # Main optimization loop
+    # ---------------------------------------------------------
+
+    history = []
+    previous_loss = None
+
+    for iteration in range(1, max_iter + 1):
+
+        W_old = W.copy()
+        H_old = H.copy()
+
+        accepted_W = False
+        accepted_H = False
+
+        # Update H.
+        if update in {"both", "H"}:
+
+            H, accepted_H, L_H, _ = update_block(
+                H, "H"
+            )
+
+        # Update W.
+        if update in {"both", "W"}:
+
+            W, accepted_W, L_W, _ = update_block(
+                W, "W"
+            )
+
+        # Evaluate complete objective.
+        loss = evaluate(W, H)
+
+        divergence = np.sqrt(2.0 * loss)
+
+        relative_change = None
+
+        if previous_loss is not None:
+
+            relative_change = (
+                abs(previous_loss - loss)
+                / max(abs(previous_loss), eps)
+            )
+
+        W_change = np.linalg.norm(W - W_old)
+        H_change = np.linalg.norm(H - H_old)
+
+        history.append({
+            "iteration": iteration,
+            "objective": loss,
+            "divergence": divergence,
+            "relative_change": relative_change,
+            "W_change": W_change,
+            "H_change": H_change,
+            "W_step_size": L_W,
+            "H_step_size": L_H,
+            "W_updated": accepted_W,
+            "H_updated": accepted_H,
+        })
+
+        if verbose:
+            print(
+                f"Iter {iteration:4d}/{max_iter} | "
+                f"D={divergence:.6e} | "
+                f"J={loss:.6e} | "
+                f"rel={relative_change if relative_change is not None else np.nan:.3e} | "
+                f"dW={W_change:.3e} | "
+                f"dH={H_change:.3e}"
+            )
+
+        if (
+            previous_loss is not None
+            and relative_change < tol
+        ):
+            break
+
+        previous_loss = loss
+
+    return W, H, history
 
 def norm_log(H, gamma=5):
     return np.log1p(gamma * H)
@@ -2081,6 +1195,7 @@ def tracks_to_dataset(
         np.concatenate(y_list, axis=0)
     )
 def extract_binary_data():
+  W_d = np.load("res.npy") 
   l = get_files("wav")
   #print(l)
   l.remove("/home/debian/tensorflow-project/Prelude-in-E-Minor-Nr-4.wav")
@@ -2097,16 +1212,15 @@ def extract_binary_data():
     spectrogram = np.abs(librosa.cqt(x,sr=f_s, fmin=librosa.note_to_hz('A0'), bins_per_octave=12 * K, n_bins=88 * K+L, hop_length=HOP, sparsity=0.05))
     #spectrogram = norm_log(spectrogram, g)
     #spectrogram = librosa.util.normalize(spectrogram, norm = 2, axis = 0, threshold = 0.05)
-    W, H, history = hnma(
+    W, H, history = kl_residual_nmf(
         spectrogram,
-        W_init=W_0,
-        n_components=88+1,
-        lambda_alpha=1e-3,
-        bins_per_octave=12*K,
-        max_iter=500,
-        tol=1e-5,
-        random_state=42,
-    )
+        W_init=W_d,
+        update="H",
+        normalize_W=False,
+        max_iter=200,
+        tol=1e-6,
+        verbose=False,
+        )
     B = midi_to_cqt_labels(
       file_name_string_audio[:-3]+"mid",
       n_frames=H.shape[1],
@@ -2114,15 +1228,12 @@ def extract_binary_data():
       hop_length=HOP,
       mode="binary"
     )
-    print(H.shape[1],B.shape[1])
+    #print(H.shape[1],B.shape[1])
     data.append((H[0:88,:],B))
     del x, W_0, Wn, spectrogram
     del W, H, B, history
   return data
 
-
-# Previous class spelling retained for compatibility.
-HNMF = HNMA
 
 my_file = Path("./traindata.npz")
 if my_file.is_file():
@@ -2193,22 +1304,14 @@ else:
     plt.ylabel("Pitch / Component index")
     plt.show()
 
-    W, H, history = hnma(
-        spectrogram,
-        W_init=W_0,
-        n_components=88+1,
-        lambda_alpha=1e-3,
-        #beta_mode='temporal_smoothness',
-        #lambda_beta=1e-6,
-        #lambda_shift=0.1,
-        #shift_bins=33,
-        #lambda_volume=1e-3,
-        #volume_delta=1e-6,
-        #volume_mode = "max",
-        bins_per_octave=12*K,
-        max_iter=500,
-        tol=1e-5,
-        random_state=42,
+    W, H, history = kl_residual_nmf(
+    spectrogram,
+    W_init=W_0,
+    update="H",
+    normalize_W=False,
+    max_iter=200,
+    tol=1e-6,
+    verbose=False,
     )
     
     V_hat = W @ H
