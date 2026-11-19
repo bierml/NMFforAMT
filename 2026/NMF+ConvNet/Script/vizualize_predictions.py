@@ -161,7 +161,7 @@ model = tf.keras.models.load_model("best_convnet.keras")
 data = np.load("res_data.npz",allow_pickle=True)
 M = data["M"]
 H = data["H"]
-predictions = data["predictions"]
+#predictions = data["predictions"]
 # Optional: inspect input/output shapes
 print("Input shape:", model.input_shape)
 print("Output shape:", model.output_shape)
@@ -190,12 +190,12 @@ onsets = librosa.onset.onset_detect(y=x, sr=f_s, hop_length=2048,units='frames')
 
 workflow = []
 
-for i in range(2, H.shape[1] - 2):
+for i in range(10, H.shape[1] - 10):
 
-    patch = H[:88, i-2:i+3].T
+    patch = H[:88, i-10:i+11].T
 
     prediction = model.predict(
-        patch.reshape(1, 5, 88, 1),
+        patch.reshape(1, 21, 88, 1),
         verbose=0
     )
 
@@ -203,7 +203,7 @@ for i in range(2, H.shape[1] - 2):
 
 workflow = np.array(workflow)
 
-a = find_best_threshold(M[:,2:-2], workflow.T)
+a = find_best_threshold(M[:,10:-10], workflow.T)
 
 binary_piano_roll = (workflow >= a[0]).astype(np.uint8).T
 #binary_piano_roll = postprocess_binary_piano_roll(binary_piano_roll, onsets, 12)
@@ -229,4 +229,4 @@ plt.title("Activation matrix W")
 plt.xlabel("Time frames")
 plt.ylabel("Pitch / Component index")
 plt.show()
-print(evaluate_results(M[:,2:-2],binary_piano_roll))
+print(evaluate_results(M[:,10:-10],binary_piano_roll))

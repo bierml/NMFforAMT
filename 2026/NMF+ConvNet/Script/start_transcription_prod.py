@@ -30,478 +30,633 @@ K = 5
 L = 0
 g = 3
 HOP = 2048
+FRAMES_NUM = 21
 
-def kl_residual_nmf(
+def exponential_temporal_weights(radius, decay=2.0, normalize=True):
+    """
+    Construct an exponential temporal weighting profile.
+
+    weights[d] corresponds to the temporal distance d.
+    weights[0] is always zero.
+    """
+    if radius < 0:
+        raise ValueError("radius must be nonnegative.")
+    if decay <= 0:
+        raise ValueError("decay must be positive.")
+
+    weights = np.zeros(radius + 1, dtype=np.float64)
+
+    if radius > 0:
+        lags = np.arange(1, radius + 1)
+        weights[1:] = np.exp(-lags / decay)
+
+        if normalize:
+            weights[1:] /= weights[1:].sum()
+
+    return weights
+
+
+def make_pitch_cross_weights(midi_notes, interval_weights):
+    """
+    Construct a pitch-dependent cross-correlation matrix.
+
+    interval_weights:
+        Dictionary mapping pitch intervals (in semitones) to
+        penalty weights.
+
+        For example:
+            {0: 1.0, 4: 0.5, 7: 0.5}
+
+        This assigns weights to octave, major-third and
+        perfect-fifth relationships.
+
+    The resulting matrix is symmetric and has a zero diagonal.
+    """
+    midi_notes = np.asarray(midi_notes)
+
+    if midi_notes.ndim != 1:
+        raise ValueError("midi_notes must be one-dimensional.")
+
+    n = len(midi_notes)
+    C = np.zeros((n, n), dtype=np.float64)
+
+    for i in range(n):
+        for j in range(i + 1, n):
+            interval = abs(int(midi_notes[i]) - int(midi_notes[j])) % 12
+
+            # Account for the symmetric interval.
+            if interval not in interval_weights:
+                interval = (12 - interval) % 12
+
+            weight = interval_weights.get(interval, 0.0)
+
+            C[i, j] = weight
+            C[j, i] = weight
+
+    return C
+
+
+def _temporal_product(H, V):
+    """
+    Calculate H @ V.
+
+    V can be:
+      - A dense (T, T) symmetric matrix.
+      - A one-dimensional lag-weight profile.
+
+    The latter avoids constructing a large T x T matrix.
+    """
+    if V.ndim == 1:
+        K, T = H.shape
+        result = np.zeros_like(H)
+
+        for lag in range(1, min(len(V), T)):
+            weight = V[lag]
+
+            if weight == 0:
+                continue
+
+            result[:, lag:] += weight * H[:, :-lag]
+            result[:, :-lag] += weight * H[:, lag:]
+
+        return result
+
+    return H @ V
+
+
+def _beta_divergence(X, Y, r, eps):
+    """
+    Bregman divergence corresponding to phi''(x) = x^(-r).
+
+    r = 0: Euclidean
+    r = 1: KL
+    r = 2: Itakura-Saito
+    """
+    Y = np.maximum(Y, eps)
+
+    if np.isclose(r, 0.0):
+        return 0.5 * np.sum((X - Y) ** 2)
+
+    if np.isclose(r, 1.0):
+        mask = X > 0
+
+        result = -X + Y
+        result = result.copy()
+
+        result[mask] += (
+            X[mask] * np.log(X[mask] / Y[mask])
+        )
+
+        return np.sum(result)
+
+    if np.isclose(r, 2.0):
+        # A small floor makes the IS objective finite for zero X.
+        X_safe = np.maximum(X, eps)
+        ratio = X_safe / Y
+
+        return np.sum(ratio - np.log(ratio) - 1.0)
+
+    # Generalized beta divergence, beta = 2 - r.
+    beta = 2.0 - r
+
+    return np.sum(
+        (
+            X ** beta
+            + (beta - 1.0) * Y ** beta
+            - beta * X * Y ** (beta - 1.0)
+        )
+        / (beta * (beta - 1.0))
+    )
+
+
+def regularized_nmf(
     X,
     n_components=None,
     *,
     W_init=None,
     H_init=None,
-    normalize_W=True,
+
+    # Divergence
+    divergence="euclidean",
+    r=None,
+
+    # Sparsity regularization
+    mu1=0.0,
+    p=1.0,
+
+    # Cross-correlation regularization
+    mu2=0.0,
+    cross_weights=None,
+
+    # Temporal regularization
+    mu3=0.0,
+    temporal_weights=None,
+    temporal_exponential=False,
+
+    # Optimization
     update="both",
+    normalize_W=True,
     max_iter=300,
     tol=1e-5,
-    eps=1e-10,
-    max_backtracking=40,
     random_state=None,
-    verbose=False,
+    eps=1e-10,
+
+    return_history=False,
 ):
     """
-    NMF minimizing the squared Frobenius norm of the element-wise
-    generalized KL-divergence residual.
+    Regularized Nonnegative Matrix Factorization based on:
 
-    Objective
-    ---------
-        min 0.5 * ||X * log(X / (W @ H))
-                      - X + W @ H||_F^2
+        Raczynski and Sagayama,
+        Multiple Frequency Estimation for Piano Recordings
+        with Concatenated Regularized Harmonic NMF.
 
-    Subject to
-    ----------
-        W >= 0
-        H >= 0
+    Objective:
+
+        D_r(X || WH)
+        + mu1 * sum(H ** p)
+        + mu2 * sum(C * (H @ H.T))
+        + beta3(H)
+
+    where:
+
+        beta3(H) = -mu3 * sum(H * (H @ V))
+
+    If temporal_exponential=True, the last term is replaced
+    by exp(beta3(H)), following the paper.
 
     Parameters
     ----------
     X : ndarray, shape (n_features, n_frames)
         Nonnegative input matrix.
 
-    n_components : int, optional
-        Number of components. Can be inferred from initial matrices.
+    n_components : int
+        Number of components. Can be omitted if W_init is given.
 
-    W_init : ndarray, optional
-        Initial basis matrix, shape (n_features, n_components).
+    W_init : ndarray, shape (n_features, n_components), optional
+        Initial basis matrix.
 
-    H_init : ndarray, optional
-        Initial activation matrix, shape (n_components, n_frames).
+    H_init : ndarray, shape (n_components, n_frames), optional
+        Initial activation matrix.
 
-    update : {'both', 'W', 'H'}
-        'both': optimize W and H alternately.
-        'W': optimize W while keeping H fixed.
-        'H': optimize H while keeping W fixed.
+    divergence : {'euclidean', 'kl', 'is'}
+        Divergence type. Ignored if r is explicitly provided.
 
-    max_iter : int
-        Maximum number of outer iterations.
+    r : float, optional
+        Parameter of phi''(x) = x^(-r).
+        Must belong to [0, 2].
 
-    tol : float
-        Relative objective-change stopping tolerance.
+    mu1 : float
+        Sparsity regularization coefficient.
 
-    eps : float
-        Numerical stabilization constant. Also added to W @ H
-        when evaluating the divergence.
+    p : float
+        Power of the sparsity penalty. The paper uses p < 2.
 
-    max_backtracking : int
-        Maximum line-search attempts per block update.
+    mu2 : float
+        Cross-correlation regularization coefficient.
 
-    random_state : int, optional
-        Random seed.
+    cross_weights : ndarray, shape (n_components, n_components)
+        Symmetric weighting matrix for cross-correlation.
 
-    verbose : bool
-        Print iteration information.
+    mu3 : float
+        Temporal regularization coefficient.
+
+    temporal_weights : ndarray
+        Either:
+          - Dense symmetric matrix (n_frames, n_frames).
+          - One-dimensional temporal lag profile.
+
+    temporal_exponential : bool
+        Replace beta3(H) by exp(beta3(H)) in the objective.
+
+    update : {'both', 'H', 'W'}
+        Which factor matrices to update.
+
+    normalize_W : bool
+        Normalize basis columns using their L2 norm.
+        The corresponding scaling is transferred to H.
+
+    return_history : bool
+        If True, also return the objective history.
 
     Returns
     -------
-    W : ndarray
-        Learned basis matrix.
+    W, H
+        Factor matrices.
 
-    H : ndarray
-        Learned activation matrix.
-
-    history : list of dict
-        Objective, divergence and update information.
+    Optionally:
+        W, H, history
     """
-    def project_simplex_columns(A):
-        """
-        Euclidean projection of each column onto:
-            {x >= 0 : sum(x) = 1}
-        """
-        U = np.sort(A, axis=0)[::-1]
-        cssv = np.cumsum(U, axis=0) - 1.0
 
-        indices = np.arange(1, A.shape[0] + 1)[:, None]
+    # -------------------------------------------------------
+    # Input validation
+    # -------------------------------------------------------
 
-        condition = U - cssv / indices > 0
-        rho = condition.sum(axis=0) - 1
-
-        theta = (
-            cssv[rho, np.arange(A.shape[1])]
-            / (rho + 1)
-        )
-
-        return np.maximum(A - theta[None, :], 0.0)
-    def evaluate(W, H, need_gradient=False):
-
-            Y = W @ H + eps
-
-            positive = X > 0
-
-            E = Y.copy()
-
-            # E = X * log(X/Y) - X + Y.
-            E[positive] = (
-                X[positive] * np.log(X[positive] / Y[positive])
-                - X[positive]
-                + Y[positive]
-            )
-
-            # Protect against tiny negative round-off errors.
-            np.maximum(E, 0.0, out=E)
-
-            objective = 0.5 * np.sum(E * E)
-
-            if not need_gradient:
-                return objective
-
-            # Gradient with respect to Y.
-            G = E * (1.0 - X / Y)
-
-            # Curvature with respect to Y.
-            curvature = (
-                (1.0 - X / Y) ** 2
-                + E * X / (Y * Y)
-            )
-
-            return objective, G, float(np.max(curvature))
-
-    # ---------------------------------------------------------
-    # Validation
-    # ---------------------------------------------------------
     X = np.asarray(X, dtype=np.float64)
 
-    if X.ndim != 2 or min(X.shape) == 0:
-        raise ValueError("X must be a non-empty 2D matrix.")
+    if X.ndim != 2:
+        raise ValueError("X must be a two-dimensional matrix.")
 
-    if not np.all(np.isfinite(X)) or np.any(X < 0):
-        raise ValueError("X must be finite and nonnegative.")
+    if not np.all(np.isfinite(X)):
+        raise ValueError("X contains NaN or infinite values.")
 
-    if update not in {"both", "W", "H"}:
-        raise ValueError("update must be 'both', 'W', or 'H'.")
-
-    if max_iter < 1 or max_backtracking < 1:
-        raise ValueError("Iteration limits must be positive.")
-
-    if tol < 0 or eps <= 0:
-        raise ValueError("tol must be nonnegative and eps positive.")
+    if np.any(X < 0):
+        raise ValueError("X must be nonnegative.")
 
     F, T = X.shape
 
-    # ---------------------------------------------------------
-    # Infer rank
-    # ---------------------------------------------------------
+    if F == 0 or T == 0:
+        raise ValueError("X must not have empty dimensions.")
 
-    inferred = []
+    if not 0 < p < 2:
+        raise ValueError("p must satisfy 0 < p < 2.")
 
-    if W_init is not None:
-        W_init = np.asarray(W_init, dtype=np.float64)
+    if min(mu1, mu2, mu3) < 0:
+        raise ValueError("Regularization coefficients must be nonnegative.")
 
-        if W_init.ndim != 2:
-            raise ValueError("W_init must be 2D.")
+    if max_iter < 1:
+        raise ValueError("max_iter must be positive.")
 
-        inferred.append(W_init.shape[1])
+    if tol < 0:
+        raise ValueError("tol must be nonnegative.")
 
-    if H_init is not None:
-        H_init = np.asarray(H_init, dtype=np.float64)
+    if eps <= 0:
+        raise ValueError("eps must be positive.")
 
-        if H_init.ndim != 2:
-            raise ValueError("H_init must be 2D.")
+    update = update.lower()
 
-        inferred.append(H_init.shape[0])
+    if update not in ("both", "h", "w"):
+        raise ValueError("update must be 'both', 'H' or 'W'.")
 
-    if n_components is None:
-        if not inferred:
+    # -------------------------------------------------------
+    # Divergence parameter
+    # -------------------------------------------------------
+
+    if r is None:
+        divergence_map = {
+            "euclidean": 0.0,
+            "kl": 1.0,
+            "is": 2.0,
+            "itakura-saito": 2.0,
+        }
+
+        if divergence.lower() not in divergence_map:
             raise ValueError(
-                "Specify n_components or provide W_init/H_init."
+                "divergence must be 'euclidean', 'kl' or 'is'."
             )
-        n_components = inferred[0]
 
-    if not isinstance(n_components, (int, np.integer)) \
-            or n_components <= 0:
-        raise ValueError("n_components must be positive.")
+        r = divergence_map[divergence.lower()]
 
-    K = int(n_components)
+    r = float(r)
 
-    if any(k != K for k in inferred):
-        raise ValueError("Initialization matrices have incompatible ranks.")
+    if not 0 <= r <= 2:
+        raise ValueError("r must belong to [0, 2].")
+
+    # -------------------------------------------------------
+    # Initialization
+    # -------------------------------------------------------
 
     rng = np.random.default_rng(random_state)
 
-    # ---------------------------------------------------------
-    # Initialize H first
-    # ---------------------------------------------------------
-
-    if H_init is not None:
-        H = np.asarray(H_init, dtype=np.float64).copy()
-
-        if H.ndim != 2 or not np.all(np.isfinite(H)):
-            raise ValueError("Invalid H_init.")
-
-        if np.any(H < 0):
-            raise ValueError("H_init must be nonnegative.")
-
-        if H.shape[1] != T:
-            raise ValueError("H_init has an incorrect number of frames.")
-
-        if n_components is not None and H.shape[0] != n_components:
-            raise ValueError("H_init has an incorrect component count.")
-
-        K = H.shape[0]
-    else:
-        if update == "W":
-            raise ValueError("H_init is required when update='W'.")
+    if W_init is None:
+        if n_components is None:
+            raise ValueError(
+                "Provide either n_components or W_init."
+            )
 
         K = int(n_components)
-        H = rng.random((K, T)) + eps
 
-    # ---------------------------------------------------------
-    # Initialize W
-    # ---------------------------------------------------------
+        if K < 1:
+            raise ValueError("n_components must be positive.")
 
-    if W_init is not None:
-        W = np.asarray(W_init, dtype=np.float64).copy()
-
-        if W.shape != (F, K):
-            raise ValueError("W_init has an incorrect shape.")
-
-        if not np.all(np.isfinite(W)) or np.any(W < 0):
-            raise ValueError("W_init must be finite and nonnegative.")
-
-    elif update == "W":
-        # Ridge-regularized least-squares initialization:
-        #
-        # W = X H.T (H H.T + ridge I)^(-1)
-
-        HH = H @ H.T
-        XH = X @ H.T
-
-        ridge = 1e-8 * max(
-            np.trace(HH) / max(K, 1),
-            1.0
-        )
-
-        W = np.linalg.solve(
-            HH + ridge * np.eye(K),
-            XH.T
-        ).T
-
-        W = np.maximum(W, eps)
-
-    else:
         W = rng.random((F, K)) + eps
 
-    # ---------------------------------------------------------
-    # Normalize W if requested
-    # ---------------------------------------------------------
+    else:
+        W = np.asarray(W_init, dtype=np.float64).copy()
 
-    if normalize_W and update in {"both", "W"}:
+        if W.ndim != 2 or W.shape[0] != F:
+            raise ValueError("W_init has an incompatible shape.")
 
-        W_scale = W.sum(axis=0)
+        K = W.shape[1]
 
-        if np.any(W_scale <= eps):
-            raise ValueError("W contains zero columns.")
+        if n_components is not None and n_components != K:
+            raise ValueError(
+                "n_components does not match W_init."
+            )
 
-        W /= W_scale[None, :]
+        if np.any(W < 0) or not np.all(np.isfinite(W)):
+            raise ValueError("W_init must be finite and nonnegative.")
 
-        # Preserve the initial reconstruction only if H is allowed
-        # to change.
-        if update == "both" and H_init is not None:
-            H *= W_scale[:, None]
-        # ---------------------------------------------------------
-        # Divergence and gradient
-        # ---------------------------------------------------------
+    if H_init is None:
+        H = None
 
-    # ---------------------------------------------------------
-    # Spectral norm squared of a Gram matrix
-    # ---------------------------------------------------------
+    else:
+        H = np.asarray(H_init, dtype=np.float64).copy()
 
-    def spectral_norm_squared(A):
+        if H.shape != (K, T):
+            raise ValueError(
+                f"H_init must have shape ({K}, {T})."
+            )
 
-        if A.shape[0] == 0:
-            return eps
+        if np.any(H < 0) or not np.all(np.isfinite(H)):
+            raise ValueError("H_init must be finite and nonnegative.")
 
-        eigenvalues = np.linalg.eigvalsh(A)
+    # -------------------------------------------------------
+    # Basis normalization
+    # -------------------------------------------------------
 
-        return max(float(eigenvalues[-1]), eps)
+    if normalize_W:
+        scales = np.maximum(np.linalg.norm(W, axis=0), eps)
 
-    # ---------------------------------------------------------
-    # Initialize block-specific step sizes
-    # ---------------------------------------------------------
+        W /= scales[None, :]
 
-    initial_loss, G, curvature_max = evaluate(
-        W, H, need_gradient=True
-    )
+        if H is not None:
+            H *= scales[:, None]
 
-    def spectral_norm_squared(A):
-        return max(
-            float(np.linalg.eigvalsh(A)[-1]),
-            eps
-        )
+    if H is None:
+        H = rng.random((K, T)) + eps
 
-    L_W = spectral_norm_squared(H @ H.T)
-    L_H = spectral_norm_squared(W.T @ W)
+    # -------------------------------------------------------
+    # Cross-correlation weights
+    # -------------------------------------------------------
 
-    # ---------------------------------------------------------
-    # Optimization helpers
-    # ---------------------------------------------------------
+    C = None
 
-    def update_block(variable, block):
+    if mu2 > 0:
+        if cross_weights is None:
+            raise ValueError(
+                "cross_weights must be provided when mu2 > 0."
+            )
 
-        nonlocal L_W, L_H
+        C = np.asarray(cross_weights, dtype=np.float64).copy()
 
-        current_loss, G, curvature_max = evaluate(
-            W, H, need_gradient=True
-        )
+        if C.shape != (K, K):
+            raise ValueError(
+                f"cross_weights must have shape ({K}, {K})."
+            )
 
-        if block == "W":
+        if not np.all(np.isfinite(C)) or np.any(C < 0):
+            raise ValueError(
+                "cross_weights must be finite and nonnegative."
+            )
 
-            gradient = G @ H.T
-            gram = H @ H.T
-            L = L_W
+        if not np.allclose(C, C.T, atol=1e-8):
+            raise ValueError("cross_weights must be symmetric.")
 
-            old = variable
+        C = 0.5 * (C + C.T)
+        np.fill_diagonal(C, 0.0)
+
+    # -------------------------------------------------------
+    # Temporal weights
+    # -------------------------------------------------------
+
+    V = None
+
+    if mu3 > 0:
+        if temporal_weights is None:
+            raise ValueError(
+                "temporal_weights must be provided when mu3 > 0."
+            )
+
+        V = np.asarray(
+            temporal_weights,
+            dtype=np.float64
+        ).copy()
+
+        if not np.all(np.isfinite(V)) or np.any(V < 0):
+            raise ValueError(
+                "temporal_weights must be finite and nonnegative."
+            )
+
+        if V.ndim == 1:
+            # V[d] represents the weight for temporal lag d.
+            V[0] = 0.0
+
+        elif V.ndim == 2:
+            if V.shape != (T, T):
+                raise ValueError(
+                    f"2D temporal_weights must have shape ({T}, {T})."
+                )
+
+            if not np.allclose(V, V.T, atol=1e-8):
+                raise ValueError(
+                    "A dense temporal weighting matrix must be symmetric."
+                )
+
+            V = 0.5 * (V + V.T)
+            np.fill_diagonal(V, 0.0)
 
         else:
-
-            gradient = W.T @ G
-            gram = W.T @ W
-            L = L_H
-
-            old = variable
-
-        # Improve initial Lipschitz estimate.
-        L = max(L, eps)
-        accepted = False
-        candidate_loss = current_loss
-
-        for bt in range(max_backtracking):
-
-            candidate = old - gradient / L
-
-            if normalize_W:
-                candidate = project_simplex_columns(candidate)
-            else:
-                candidate = np.maximum(candidate, 0.0)
-
-            delta = candidate - old
-
-            delta_norm_sq = np.sum(delta * delta)
-
-            if delta_norm_sq <= eps**2:
-                accepted = True
-                break
-
-            if block == "W":
-                candidate_loss = evaluate(candidate, H)
-            else:
-                candidate_loss = evaluate(W, candidate)
-
-            # Quadratic majorization condition.
-            upper_bound = (
-                current_loss
-                + np.sum(gradient * delta)
-                + 0.5 * L * delta_norm_sq
+            raise ValueError(
+                "temporal_weights must be 1D or 2D."
             )
 
-            tolerance = 1e-12 * max(1.0, abs(current_loss))
+    # -------------------------------------------------------
+    # Objective function
+    # -------------------------------------------------------
 
-            if (
-                np.isfinite(candidate_loss)
-                and candidate_loss <= upper_bound + tolerance
-                and candidate_loss <= current_loss + tolerance
-            ):
-                accepted = True
-                break
+    def calculate_objective(W, H):
 
-            L *= 2.0
+        Y = np.maximum(W @ H, eps)
 
-        if accepted:
+        loss = _beta_divergence(X, Y, r, eps)
 
-            # Store the accepted step size for the next iteration.
-            if block == "W":
-                L_W = L
+        # Sparsity penalty
+        if mu1 > 0:
+            loss += mu1 * np.sum(H ** p)
+
+        # Cross-correlation penalty
+        if mu2 > 0:
+            loss += mu2 * np.sum(C * (H @ H.T))
+
+        # Temporal penalty
+        if mu3 > 0:
+            HV = _temporal_product(H, V)
+
+            beta3 = -mu3 * np.sum(H * HV)
+
+            if temporal_exponential:
+                loss += np.exp(np.clip(beta3, -50.0, 50.0))
             else:
-                L_H = L
+                loss += beta3
 
-            return candidate, True, L, float(candidate_loss)
+        return float(loss)
 
-        return old, False, L, float(current_loss)
-
-    # ---------------------------------------------------------
-    # Main optimization loop
-    # ---------------------------------------------------------
+    # -------------------------------------------------------
+    # Multiplicative optimization
+    # -------------------------------------------------------
 
     history = []
+
     previous_loss = None
 
-    for iteration in range(1, max_iter + 1):
+    for iteration in range(max_iter):
 
-        W_old = W.copy()
-        H_old = H.copy()
+        # ===============================================
+        # Update W
+        # ===============================================
 
-        accepted_W = False
-        accepted_H = False
+        if update in ("both", "w"):
 
-        # Update H.
-        if update in {"both", "H"}:
+            Y = np.maximum(W @ H, eps)
 
-            H, accepted_H, L_H, _ = update_block(
-                H, "H"
+            X_weighted = X * Y ** (-r)
+            Y_weighted = Y ** (1.0 - r)
+
+            numerator_W = X_weighted @ H.T
+            denominator_W = Y_weighted @ H.T
+
+            W *= (
+                np.maximum(numerator_W, eps)
+                / np.maximum(denominator_W, eps)
             )
 
-        # Update W.
-        if update in {"both", "W"}:
+            # Normalize basis and transfer its scale to H.
+            if normalize_W:
+                scales = np.maximum(
+                    np.linalg.norm(W, axis=0),
+                    eps
+                )
 
-            W, accepted_W, L_W, _ = update_block(
-                W, "W"
+                W /= scales[None, :]
+                H *= scales[:, None]
+
+        # ===============================================
+        # Update H
+        # ===============================================
+
+        if update in ("both", "h"):
+
+            Y = np.maximum(W @ H, eps)
+
+            X_weighted = X * Y ** (-r)
+            Y_weighted = Y ** (1.0 - r)
+
+            numerator_H = W.T @ X_weighted
+            denominator_H = W.T @ Y_weighted
+
+            # -------------------------------------------
+            # 1. Sparsity regularization
+            # -------------------------------------------
+
+            if mu1 > 0:
+
+                sparsity_gradient = (
+                    mu1 * p * np.maximum(H, eps) ** (p - 1.0)
+                )
+
+                denominator_H += sparsity_gradient
+
+            # -------------------------------------------
+            # 2. Cross-correlation regularization
+            # -------------------------------------------
+
+            if mu2 > 0:
+
+                cross_gradient = 2.0 * mu2 * (C @ H)
+
+                denominator_H += cross_gradient
+
+            # -------------------------------------------
+            # 3. Temporal regularization
+            # -------------------------------------------
+
+            if mu3 > 0:
+
+                HV = _temporal_product(H, V)
+
+                beta3 = -mu3 * np.sum(H * HV)
+
+                if temporal_exponential:
+                    temporal_scale = np.exp(
+                        np.clip(beta3, -50.0, 50.0)
+                    )
+                else:
+                    temporal_scale = 1.0
+
+                # The gradient is negative:
+                #
+                # grad(beta3) = -2 * mu3 * H @ V
+                #
+                # Therefore, its magnitude is added to
+                # the numerator of the multiplicative update.
+
+                numerator_H += (
+                    2.0 * mu3 * temporal_scale * HV
+                )
+
+            # -------------------------------------------
+            # Multiplicative update
+            # -------------------------------------------
+
+            H *= (
+                np.maximum(numerator_H, eps)
+                / np.maximum(denominator_H, eps)
             )
 
-        # Evaluate complete objective.
-        loss = evaluate(W, H)
+        # ===============================================
+        # Evaluate objective
+        # ===============================================
 
-        divergence = np.sqrt(2.0 * loss)
+        current_loss = calculate_objective(W, H)
 
-        relative_change = None
+        history.append(current_loss)
 
-        if previous_loss is not None:
+        if previous_loss is not None and tol > 0:
 
             relative_change = (
-                abs(previous_loss - loss)
+                abs(previous_loss - current_loss)
                 / max(abs(previous_loss), eps)
             )
 
-        W_change = np.linalg.norm(W - W_old)
-        H_change = np.linalg.norm(H - H_old)
+            if relative_change < tol:
+                break
 
-        history.append({
-            "iteration": iteration,
-            "objective": loss,
-            "divergence": divergence,
-            "relative_change": relative_change,
-            "W_change": W_change,
-            "H_change": H_change,
-            "W_step_size": L_W,
-            "H_step_size": L_H,
-            "W_updated": accepted_W,
-            "H_updated": accepted_H,
-        })
+        previous_loss = current_loss
 
-        if verbose:
-            print(
-                f"Iter {iteration:4d}/{max_iter} | "
-                f"D={divergence:.6e} | "
-                f"J={loss:.6e} | "
-                f"rel={relative_change if relative_change is not None else np.nan:.3e} | "
-                f"dW={W_change:.3e} | "
-                f"dH={H_change:.3e}"
-            )
+    if return_history:
+        return W, H, np.asarray(history)
 
-        if (
-            previous_loss is not None
-            and relative_change < tol
-        ):
-            break
-
-        previous_loss = loss
-
-    return W, H, history
+    return W, H
 
 def norm_log(H, gamma=5):
     return np.log1p(gamma * H)
@@ -955,6 +1110,7 @@ def build_convnet(
     )
 
     return model
+
 def train_convnet(
     model,
     X_train,
@@ -1073,6 +1229,7 @@ def train_convnet(
     model.save(output_path)
 
     return history
+
 def make_context_dataset(
     spectrogram,
     piano_roll,
@@ -1152,6 +1309,7 @@ def make_context_dataset(
     )
 
     return X, piano_roll
+
 def tracks_to_dataset(
     tracks,
     context_frames=5
@@ -1194,8 +1352,22 @@ def tracks_to_dataset(
         np.concatenate(X_list, axis=0),
         np.concatenate(y_list, axis=0)
     )
+
+midi_notes = np.arange(21, 109)
+C = make_pitch_cross_weights(midi_notes, interval_weights={
+            0: 1.0,   # Octaves
+            4: 0.5,   # Major thirds
+            7: 0.5,   # Perfect fifths
+        }
+    )
+    
+V = exponential_temporal_weights(
+        radius=5,
+        decay=2.0,
+        normalize=True
+    )
+
 def extract_binary_data():
-  W_d = np.load("res.npy") 
   l = get_files("wav")
   #print(l)
   l.remove("/home/debian/tensorflow-project/Prelude-in-E-Minor-Nr-4.wav")
@@ -1207,20 +1379,39 @@ def extract_binary_data():
   for file_name_string_audio in l:
     f_s, x = read_wav_as_float(file_name_string_audio)
     W_0 = build_W0(sr=f_s, bins_per_octave=12*K, n_bins=88 * K+L, fmin=librosa.note_to_hz('A0'), sigma=1.75)
-    Wn = build_noise_basis(88*K+L, 1)
-    W_0 = np.concatenate([W_0, Wn], axis=1)
+    #Wn = build_noise_basis(88*K+L, 1)
+    #W_0 = np.concatenate([W_0, Wn], axis=1)
     spectrogram = np.abs(librosa.cqt(x,sr=f_s, fmin=librosa.note_to_hz('A0'), bins_per_octave=12 * K, n_bins=88 * K+L, hop_length=HOP, sparsity=0.05))
     #spectrogram = norm_log(spectrogram, g)
-    #spectrogram = librosa.util.normalize(spectrogram, norm = 2, axis = 0, threshold = 0.05)
-    W, H, history = kl_residual_nmf(
+    spectrogram = librosa.util.normalize(spectrogram, norm = 2, axis = 0, threshold = 0.05)
+    W, H, history = regularized_nmf(
         spectrogram,
-        W_init=W_d,
-        update="H",
-        normalize_W=False,
-        max_iter=200,
-        tol=1e-6,
-        verbose=False,
-        )
+        n_components=88,
+    
+        W_init=W_0,
+    
+        divergence="kl",
+    
+        # Sparsity
+        mu1=1e-3,
+        p=1.0,
+    
+        # Cross-correlation
+        #mu2=0.01,
+        #cross_weights=C,
+    
+        # Temporal smoothness
+        #mu3=0.001,
+        #temporal_weights=V,
+    
+        # Keep the harmonic dictionary fixed
+        update="both",
+    
+        max_iter=300,
+        tol=1e-5,
+    
+        return_history=True
+    )
     B = midi_to_cqt_labels(
       file_name_string_audio[:-3]+"mid",
       n_frames=H.shape[1],
@@ -1229,27 +1420,31 @@ def extract_binary_data():
       mode="binary"
     )
     #print(H.shape[1],B.shape[1])
-    data.append((H[0:88,:],B))
-    del x, W_0, Wn, spectrogram
+    data.append((H,B))
+    del x, spectrogram
     del W, H, B, history
   return data
 
-
 my_file = Path("./traindata.npz")
+
 if my_file.is_file():
     model = build_convnet(
         K=1,
-        context_frames=5,
+        context_frames=FRAMES_NUM,
         n_pitches=88,
         target_mode="binary",
-        learning_rate=1e-3
+        learning_rate=1e-5
     )
     model.summary()
-    loaded = np.load("traindata.npz")
-    data = [
-        loaded[f"data_{i}"]
-        for i in range(64)
-    ]
+    loaded = np.load("traindata.npz", allow_pickle=True)
+    
+    data_keys = sorted(
+        [key for key in loaded.files if key.startswith("data_")],
+        key=lambda key: int(key.split("_")[1])
+    )
+    
+    data = [loaded[key] for key in data_keys]
+    
     H = loaded["H"]
     H1 = med_filter(H,sz=9)
     #H1 = med_filter(H)
@@ -1260,7 +1455,8 @@ if my_file.is_file():
     t = H3.max() * 0.125
     H4 = (H3 > t).astype(int)
     H5 = enforce_min_duration(H4,min_len=15)[0:88,:]
-    M = midi_to_cqt_labels("Prelude-in-E-Minor-Nr-4.mid", H.shape[1], 44100,2048)
+    f_s = read_wav_as_float("Prelude-in-E-Minor-Nr-4.wav")[0]
+    M = midi_to_cqt_labels("Prelude-in-E-Minor-Nr-4.mid", H.shape[1], f_s, HOP)
     #z = analyse_spectrogram(spectrogram, onsets)
     #H6 = clear_H(H5,onsets,z)
     plt.figure()
@@ -1283,7 +1479,7 @@ else:
     onsets = librosa.onset.onset_detect(y=x, sr=f_s, hop_length=HOP,units='frames')
 
     #spectrogram = norm_log(spectrogram, g)
-    #spectrogram = librosa.util.normalize(spectrogram, norm = 2, axis = 0, threshold = 0.05)
+    spectrogram = librosa.util.normalize(spectrogram, norm = 2, axis = 0, threshold = 0.05)
 
     plt.figure()
     plt.imshow(spectrogram, aspect='auto', origin='lower')
@@ -1293,25 +1489,42 @@ else:
     plt.ylabel("Pitch / Component index")
     plt.show()
 
-    W_0 = build_W0(sr=f_s, bins_per_octave=12*K, n_bins=88 * K+L, fmin=librosa.note_to_hz('A0'), sigma=1.75)
-    Wn = build_noise_basis(88*K+L, 1)
-    W_0 = np.concatenate([W_0, Wn], axis=1)
+    W_0 = np.load("res.npy")
     plt.figure()
-    plt.imshow(W_0, aspect='auto', origin='lower')
+    plt.imshow(spectrogram, aspect='auto', origin='lower')
     plt.colorbar()
     plt.title("Activation matrix W")
     plt.xlabel("Time frames")
     plt.ylabel("Pitch / Component index")
     plt.show()
 
-    W, H, history = kl_residual_nmf(
-    spectrogram,
-    W_init=W_0,
-    update="H",
-    normalize_W=False,
-    max_iter=200,
-    tol=1e-6,
-    verbose=False,
+    W, H, history = regularized_nmf(
+        spectrogram,
+        n_components=88,
+    
+        W_init=W_0,
+    
+        divergence="kl",
+    
+        # Sparsity
+        mu1=1e-3,
+        p=1.0,
+    
+        # Cross-correlation
+        #mu2=0.01,
+        #cross_weights=C,
+    
+        # Temporal smoothness
+        #mu3=0.001,
+        #temporal_weights=V,
+    
+        # Keep the harmonic dictionary fixed
+        update="both",
+    
+        max_iter=300,
+        tol=1e-5,
+    
+        return_history=True
     )
     
     V_hat = W @ H
@@ -1367,7 +1580,7 @@ else:
     l = get_files("")
     print(l)
 
-    M = midi_to_cqt_labels("Prelude-in-E-Minor-Nr-4.mid", H.shape[1], 44100,2048)
+    M = midi_to_cqt_labels("Prelude-in-E-Minor-Nr-4.mid", H.shape[1], f_s, HOP)
 
     plt.imshow(M, aspect='auto', origin='lower')
     plt.colorbar()
@@ -1397,10 +1610,10 @@ else:
 
     model = build_convnet(
         K=1,
-        context_frames=5,
+        context_frames=FRAMES_NUM,
         n_pitches=88,
         target_mode="binary",
-        learning_rate=1e-3
+        learning_rate=1e-5
     )
 
     model.summary()
@@ -1420,12 +1633,12 @@ val_tracks = [(l[0].T,l[1].T) for l in data[(len(data)*3)//8:(len(data)*4)//8]]
 
 X_train, y_train = tracks_to_dataset(
     train_tracks,
-    context_frames=5
+    context_frames=FRAMES_NUM
 )
 
 X_val, y_val = tracks_to_dataset(
     val_tracks,
-    context_frames=5
+    context_frames=FRAMES_NUM
 )
 
 print("Training input:", X_train.shape)
@@ -1465,8 +1678,5 @@ plt.legend()
 plt.grid()
 plt.show()
 
-H_f = H[:88,:(H.shape[1]//5)*5].T
-predictions = model.predict(H_f.reshape(H_f.shape[0] // 5, 5, 88,1))
-binary_piano_roll = (predictions >= 0.1).astype(np.uint8)
-np.savez("res_data.npz", M=M, H=H, predictions=predictions)
+np.savez("res_data.npz", M=M, H=H)
 
