@@ -33,6 +33,21 @@ g = 3
 HOP = 1024
 CONTEXT_FRAMES = 11
 
+
+def normalize_piano_roll(H, gamma=5.0):
+
+    H = np.asarray(H, dtype=np.float32)
+
+    H = np.maximum(H, 0.0)
+
+    H = np.log1p(gamma * H)
+
+    scale = np.percentile(H, 99)
+
+    H /= max(scale, 1e-8)
+
+    return H
+
 def hnma_tf(
     X,
     n_components,
@@ -571,30 +586,27 @@ def midi_to_cqt_labels(
 
     return B
 
-def mycustomloss(y_true, y_pred):
+def make_weighted_bce(pos_weight=5.0):
 
-    epsilon = tf.keras.backend.epsilon()
+    def loss(y_true, y_pred):
 
-    axes = [1]  # Sum over pitches
+        eps = tf.keras.backend.epsilon()
 
-    TP = tf.reduce_sum(
-        y_true * y_pred, axis=axes
-    )
+        y_pred = tf.clip_by_value(
+            y_pred,
+            eps,
+            1.0 - eps
+        )
 
-    FP = tf.reduce_sum(
-        (1.0 - y_true) * y_pred, axis=axes
-    )
+        bce = -(
+            pos_weight * y_true * tf.math.log(y_pred)
+            +
+            (1.0 - y_true) * tf.math.log(1.0 - y_pred)
+        )
 
-    FN = tf.reduce_sum(
-        y_true * (1.0 - y_pred), axis=axes
-    )
+        return tf.reduce_mean(bce)
 
-    F1 = (
-        2.0 * TP /
-        (2.0 * TP + FP + FN + epsilon)
-    )
-
-    return tf.reduce_mean(1.0 - F1)
+    return loss
 
 def build_convnet(
     context_frames=5,
@@ -747,7 +759,7 @@ def build_convnet(
             learning_rate=learning_rate
         ),
         #loss=mycustomloss,
-	loss=loss,
+	loss=make_weighted_bce(pos_weight=5.265),
         metrics=metrics
     )
 
@@ -1029,6 +1041,7 @@ def extract_binary_data():
       hop_length=HOP,
       mode="binary"
     )
+    H = norm_log(H,5)
     print(H.shape[1],B.shape[1])
     data.append((H[0:88,:],B))
     del x, spectrogram
@@ -1065,6 +1078,7 @@ if my_file.is_file():
     M = midi_to_cqt_labels("Prelude-in-E-Minor-Nr-4.mid", H.shape[1], 44100, HOP)
     #z = analyse_spectrogram(spectrogram, onsets)
     #H6 = clear_H(H5,onsets,z)
+    H = norm_log(H,5)
     plt.figure()
     plt.imshow(H5, aspect='auto', origin='lower')
     plt.colorbar()
@@ -1114,7 +1128,7 @@ else:
     )
     
     V_hat = W @ H
-
+    H = norm_log(H,5)
     print("W:", W.shape)
     print("H:", H.shape)
 
@@ -1227,6 +1241,19 @@ X_val, y_val = tracks_to_dataset(
     context_frames=CONTEXT_FRAMES
 )
 
+
+positive = np.sum(y_train)
+negative = y_train.size - positive
+
+pos_weight = np.sqrt(
+    negative / max(positive, 1)
+)
+
+pos_weight = np.clip(pos_weight, 1.0, 20.0)
+
+
+print("RECOMMENDED pos_weight: ", pos_weight)
+
 print("Training input:", X_train.shape)
 print("Training targets:", y_train.shape)
 
@@ -1239,7 +1266,7 @@ history = train_convnet(
     y_train,
     X_val,
     y_val,
-    batch_size=128,
+    batch_size=512,
     epochs=50,
     checkpoint_path="best_convnet.keras",
     output_path="convnet.keras",

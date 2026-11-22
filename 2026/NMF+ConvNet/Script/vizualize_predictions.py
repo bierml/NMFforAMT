@@ -178,8 +178,7 @@ def evaluate_results(H_et,H):
 #model = tf.keras.models.load_model("best_convnet.keras", safe_mode=False)
 model = tf.keras.models.load_model(
     "best_convnet.keras",
-    custom_objects={"mycustomloss": mycustomloss},
-    safe_mode=False
+    compile=False
 )
 data = np.load("res_data.npz",allow_pickle=True)
 M = data["M"]
