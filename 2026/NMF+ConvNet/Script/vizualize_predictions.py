@@ -34,6 +34,65 @@ import keras
 from scipy.io import wavfile
 import librosa
 from scipy.ndimage import label
+CONTEXT_FRAMES = 11
+HOP_SIZE = 1024
+
+def mycustomloss(y_true, y_pred):
+
+    epsilon = tf.keras.backend.epsilon()
+
+    TP = tf.reduce_sum(y_true * y_pred, axis=1)
+    FP = tf.reduce_sum((1.0 - y_true) * y_pred, axis=1)
+    FN = tf.reduce_sum(y_true * (1.0 - y_pred), axis=1)
+
+    F1 = (
+        2.0 * TP /
+        (2.0 * TP + FP + FN + epsilon)
+    )
+
+    return tf.reduce_mean(1.0 - F1)
+
+
+def find_best_threshold(y_true, probabilities):
+
+    thresholds = np.arange(
+        0.05, 0.96, 0.01
+    )
+
+    best_f1 = -1.0
+    best_threshold = 0.5
+
+    for threshold in thresholds:
+
+        predictions = (
+            probabilities >= threshold
+        ).astype(np.uint8)
+
+        tp = np.sum(
+            (y_true == 1) & (predictions == 1)
+        )
+
+        fp = np.sum(
+            (y_true == 0) & (predictions == 1)
+        )
+
+        fn = np.sum(
+            (y_true == 1) & (predictions == 0)
+        )
+
+        precision = tp / max(tp + fp, 1)
+        recall = tp / max(tp + fn, 1)
+
+        f1 = (
+            2 * precision * recall /
+            max(precision + recall, 1e-10)
+        )
+
+        if f1 > best_f1:
+            best_f1 = f1
+            best_threshold = threshold
+
+    return best_threshold, best_f1
 
 def postprocess_binary_piano_roll(piano_roll, onsets, threshold):
     """
@@ -110,58 +169,21 @@ def evaluate_results(H_et,H):
     TP += sum(1 for t, p in zip(H_et[:,i], H[:,i]) if t == 1 and p == 1)
     FP += sum(1 for t, p in zip(H_et[:,i], H[:,i]) if t == 0 and p == 1)
     FN += sum(1 for t, p in zip(H_et[:,i], H[:,i]) if t == 1 and p == 0)
-  P = TP / (TP + FP)
-  R = TP / (TP + FN)
-  F1 = 2 * P * R / (P + R)
+  P = TP / (TP + FP + 1e-10)
+  R = TP / (TP + FN + 1e-10)
+  F1 = 2 * P * R / (P + R + 1e-10)
   return (P,R,F1)
 
-def find_best_threshold(y_true, probabilities):
-
-    thresholds = np.arange(
-        0.05, 0.96, 0.01
-    )
-
-    best_f1 = -1.0
-    best_threshold = 0.5
-
-    for threshold in thresholds:
-
-        predictions = (
-            probabilities >= threshold
-        ).astype(np.uint8)
-
-        tp = np.sum(
-            (y_true == 1) & (predictions == 1)
-        )
-
-        fp = np.sum(
-            (y_true == 0) & (predictions == 1)
-        )
-
-        fn = np.sum(
-            (y_true == 1) & (predictions == 0)
-        )
-
-        precision = tp / max(tp + fp, 1)
-        recall = tp / max(tp + fn, 1)
-
-        f1 = (
-            2 * precision * recall /
-            max(precision + recall, 1e-10)
-        )
-
-        if f1 > best_f1:
-            best_f1 = f1
-            best_threshold = threshold
-
-    return best_threshold, best_f1
-
 # Load the trained model
-model = tf.keras.models.load_model("best_convnet.keras")
+#model = tf.keras.models.load_model("best_convnet.keras", safe_mode=False)
+model = tf.keras.models.load_model(
+    "best_convnet.keras",
+    custom_objects={"mycustomloss": mycustomloss},
+    safe_mode=False
+)
 data = np.load("res_data.npz",allow_pickle=True)
 M = data["M"]
 H = data["H"]
-#predictions = data["predictions"]
 # Optional: inspect input/output shapes
 print("Input shape:", model.input_shape)
 print("Output shape:", model.output_shape)
@@ -184,27 +206,23 @@ elif(x.dtype==np.int16):
   x = x / (2**15)
 else:
   raise ValueError(f"Unsupported sample type: {x.dtype}")
-spectrogram = np.abs(librosa.cqt(x,sr=f_s, fmin=librosa.note_to_hz('A0'), bins_per_octave=12 * 5, n_bins=88 * 5+0, hop_length=2048, sparsity=0.05))
-onsets = librosa.onset.onset_detect(y=x, sr=f_s, hop_length=2048,units='frames')
-
+spectrogram = np.abs(librosa.cqt(x,sr=f_s, fmin=librosa.note_to_hz('A0'), bins_per_octave=12 * 5, n_bins=88 * 5+0, hop_length=HOP_SIZE, sparsity=0.05))
+onsets = librosa.onset.onset_detect(y=x, sr=f_s, hop_length=HOP_SIZE,units='frames')
 
 workflow = []
 
-for i in range(10, H.shape[1] - 10):
+for i in range(CONTEXT_FRAMES//2, H.shape[1] - CONTEXT_FRAMES//2):
 
-    patch = H[:88, i-10:i+11].T
-
+    patch = H[:88, i-CONTEXT_FRAMES//2:i+CONTEXT_FRAMES//2+1].T
     prediction = model.predict(
-        patch.reshape(1, 21, 88, 1),
+        patch.reshape(1, CONTEXT_FRAMES, 88, 1),
         verbose=0
     )
 
     workflow.append(prediction[0])
 
 workflow = np.array(workflow)
-
-a = find_best_threshold(M[:,10:-10], workflow.T)
-
+a = find_best_threshold(M[:,CONTEXT_FRAMES//2:-(CONTEXT_FRAMES//2)], workflow.T)
 binary_piano_roll = (workflow >= a[0]).astype(np.uint8).T
 #binary_piano_roll = postprocess_binary_piano_roll(binary_piano_roll, onsets, 12)
 #binary_piano_roll = enforce_min_duration(binary_piano_roll,min_len=12)
@@ -229,4 +247,4 @@ plt.title("Activation matrix W")
 plt.xlabel("Time frames")
 plt.ylabel("Pitch / Component index")
 plt.show()
-print(evaluate_results(M[:,10:-10],binary_piano_roll))
+print(evaluate_results(M[:,CONTEXT_FRAMES//2:-(CONTEXT_FRAMES//2)],binary_piano_roll))

@@ -24,727 +24,346 @@ import soundfile as sf
 os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
 import keras
 np.random.seed(42)
+tf.random.set_seed(42)
 ArrayLike = Union[np.ndarray, list]
 
 K = 5
 L = 0
 g = 3
-HOP = 2048
-FRAMES_NUM = 21
+HOP = 1024
+CONTEXT_FRAMES = 11
 
-def exponential_temporal_weights(radius, decay=2.0, normalize=True):
-    """
-    Construct an exponential temporal weighting profile.
-
-    weights[d] corresponds to the temporal distance d.
-    weights[0] is always zero.
-    """
-    if radius < 0:
-        raise ValueError("radius must be nonnegative.")
-    if decay <= 0:
-        raise ValueError("decay must be positive.")
-
-    weights = np.zeros(radius + 1, dtype=np.float64)
-
-    if radius > 0:
-        lags = np.arange(1, radius + 1)
-        weights[1:] = np.exp(-lags / decay)
-
-        if normalize:
-            weights[1:] /= weights[1:].sum()
-
-    return weights
-
-
-def make_pitch_cross_weights(midi_notes, interval_weights):
-    """
-    Construct a pitch-dependent cross-correlation matrix.
-
-    interval_weights:
-        Dictionary mapping pitch intervals (in semitones) to
-        penalty weights.
-
-        For example:
-            {0: 1.0, 4: 0.5, 7: 0.5}
-
-        This assigns weights to octave, major-third and
-        perfect-fifth relationships.
-
-    The resulting matrix is symmetric and has a zero diagonal.
-    """
-    midi_notes = np.asarray(midi_notes)
-
-    if midi_notes.ndim != 1:
-        raise ValueError("midi_notes must be one-dimensional.")
-
-    n = len(midi_notes)
-    C = np.zeros((n, n), dtype=np.float64)
-
-    for i in range(n):
-        for j in range(i + 1, n):
-            interval = abs(int(midi_notes[i]) - int(midi_notes[j])) % 12
-
-            # Account for the symmetric interval.
-            if interval not in interval_weights:
-                interval = (12 - interval) % 12
-
-            weight = interval_weights.get(interval, 0.0)
-
-            C[i, j] = weight
-            C[j, i] = weight
-
-    return C
-
-
-def _temporal_product(H, V):
-    """
-    Calculate H @ V.
-
-    V can be:
-      - A dense (T, T) symmetric matrix.
-      - A one-dimensional lag-weight profile.
-
-    The latter avoids constructing a large T x T matrix.
-    """
-    if V.ndim == 1:
-        K, T = H.shape
-        result = np.zeros_like(H)
-
-        for lag in range(1, min(len(V), T)):
-            weight = V[lag]
-
-            if weight == 0:
-                continue
-
-            result[:, lag:] += weight * H[:, :-lag]
-            result[:, :-lag] += weight * H[:, lag:]
-
-        return result
-
-    return H @ V
-
-
-def _beta_divergence(X, Y, r, eps):
-    """
-    Bregman divergence corresponding to phi''(x) = x^(-r).
-
-    r = 0: Euclidean
-    r = 1: KL
-    r = 2: Itakura-Saito
-    """
-    Y = np.maximum(Y, eps)
-
-    if np.isclose(r, 0.0):
-        return 0.5 * np.sum((X - Y) ** 2)
-
-    if np.isclose(r, 1.0):
-        mask = X > 0
-
-        result = -X + Y
-        result = result.copy()
-
-        result[mask] += (
-            X[mask] * np.log(X[mask] / Y[mask])
-        )
-
-        return np.sum(result)
-
-    if np.isclose(r, 2.0):
-        # A small floor makes the IS objective finite for zero X.
-        X_safe = np.maximum(X, eps)
-        ratio = X_safe / Y
-
-        return np.sum(ratio - np.log(ratio) - 1.0)
-
-    # Generalized beta divergence, beta = 2 - r.
-    beta = 2.0 - r
-
-    return np.sum(
-        (
-            X ** beta
-            + (beta - 1.0) * Y ** beta
-            - beta * X * Y ** (beta - 1.0)
-        )
-        / (beta * (beta - 1.0))
-    )
-
-
-def regularized_nmf(
+def hnma_tf(
     X,
-    n_components=None,
+    n_components,
     *,
-    W_init=None,
-    H_init=None,
-
-    # Divergence
-    divergence="euclidean",
-    r=None,
-
-    # Sparsity regularization
-    mu1=0.0,
-    p=1.0,
-
-    # Cross-correlation regularization
-    mu2=0.0,
-    cross_weights=None,
-
-    # Temporal regularization
-    mu3=0.0,
-    temporal_weights=None,
-    temporal_exponential=False,
-
-    # Optimization
-    update="both",
-    normalize_W=True,
+    A_init=None,
+    S_init=None,
+    harmonic_mask=None,
+    lambda_A=1.0,
+    shift_bins=1,  # NEW
     max_iter=300,
-    tol=1e-5,
-    random_state=None,
-    eps=1e-10,
-
-    return_history=False,
+    eps=1e-9,
+    seed=None,
+    return_loss=False,
 ):
     """
-    Regularized Nonnegative Matrix Factorization based on:
+    Harmonic Nonnegative Matrix Approximation (HNMA).
 
-        Raczynski and Sagayama,
-        Multiple Frequency Estimation for Piano Recordings
-        with Concatenated Regularized Harmonic NMF.
+    Based on:
+        Raczynski, Ono, Sagayama (MIREX 2007).
 
     Objective:
+        0.5 * ||X - A @ S||_F^2
+        + 0.5 * lambda_A * ||A - T(A)||_F^2
 
-        D_r(X || WH)
-        + mu1 * sum(H ** p)
-        + mu2 * sum(C * (H @ H.T))
-        + beta3(H)
-
-    where:
-
-        beta3(H) = -mu3 * sum(H * (H @ V))
-
-    If temporal_exponential=True, the last term is replaced
-    by exp(beta3(H)), following the paper.
+    where T(A) shifts A down by one frequency bin
+    and right by one component.
 
     Parameters
     ----------
-    X : ndarray, shape (n_features, n_frames)
-        Nonnegative input matrix.
+    X : array-like, shape (F, T)
+        Nonnegative input spectrogram.
 
     n_components : int
-        Number of components. Can be omitted if W_init is given.
+        Number of basis vectors.
 
-    W_init : ndarray, shape (n_features, n_components), optional
+    A_init : array-like, optional, shape (F, K)
         Initial basis matrix.
 
-    H_init : ndarray, shape (n_components, n_frames), optional
+    S_init : array-like, optional, shape (K, T)
         Initial activation matrix.
 
-    divergence : {'euclidean', 'kl', 'is'}
-        Divergence type. Ignored if r is explicitly provided.
+    harmonic_mask : array-like, optional, shape (F, K)
+        Binary mask defining allowed basis frequencies.
+        Zeros remain zeros throughout optimization.
 
-    r : float, optional
-        Parameter of phi''(x) = x^(-r).
-        Must belong to [0, 2].
+    lambda_A : float
+        Strength of harmonic similarity regularization.
 
-    mu1 : float
-        Sparsity regularization coefficient.
+    max_iter : int
+        Number of iterations.
 
-    p : float
-        Power of the sparsity penalty. The paper uses p < 2.
+    eps : float
+        Numerical stability constant.
 
-    mu2 : float
-        Cross-correlation regularization coefficient.
+    seed : int, optional
+        Random initialization seed.
 
-    cross_weights : ndarray, shape (n_components, n_components)
-        Symmetric weighting matrix for cross-correlation.
-
-    mu3 : float
-        Temporal regularization coefficient.
-
-    temporal_weights : ndarray
-        Either:
-          - Dense symmetric matrix (n_frames, n_frames).
-          - One-dimensional temporal lag profile.
-
-    temporal_exponential : bool
-        Replace beta3(H) by exp(beta3(H)) in the objective.
-
-    update : {'both', 'H', 'W'}
-        Which factor matrices to update.
-
-    normalize_W : bool
-        Normalize basis columns using their L2 norm.
-        The corresponding scaling is transferred to H.
-
-    return_history : bool
-        If True, also return the objective history.
+    return_loss : bool
+        Return final objective value if True.
 
     Returns
     -------
-    W, H
-        Factor matrices.
-
-    Optionally:
-        W, H, history
+    A : np.ndarray, shape (F, K)
+    S : np.ndarray, shape (K, T)
+    loss : float, optional
     """
 
-    # -------------------------------------------------------
-    # Input validation
-    # -------------------------------------------------------
+    # --------------------------------------------------
+    # Input preparation
+    # --------------------------------------------------
 
-    X = np.asarray(X, dtype=np.float64)
+    X = tf.convert_to_tensor(X, dtype=tf.float32)
 
-    if X.ndim != 2:
-        raise ValueError("X must be a two-dimensional matrix.")
+    tf.debugging.assert_rank(X, 2)
+    tf.debugging.assert_all_finite(X, "X contains NaN or Inf")
+    tf.debugging.assert_greater_equal(X, 0.0)
 
-    if not np.all(np.isfinite(X)):
-        raise ValueError("X contains NaN or infinite values.")
+    F = tf.shape(X)[0]
+    T = tf.shape(X)[1]
+    K = n_components
 
-    if np.any(X < 0):
-        raise ValueError("X must be nonnegative.")
+    if K < 1:
+        raise ValueError("n_components must be positive.")
 
-    F, T = X.shape
+    if lambda_A < 0:
+        raise ValueError("lambda_A must be nonnegative.")
 
-    if F == 0 or T == 0:
-        raise ValueError("X must not have empty dimensions.")
+    eps = tf.constant(eps, dtype=tf.float32)
+    lam = tf.constant(lambda_A, dtype=tf.float32)
 
-    if not 0 < p < 2:
-        raise ValueError("p must satisfy 0 < p < 2.")
+    # --------------------------------------------------
+    # Harmonic support
+    # --------------------------------------------------
 
-    if min(mu1, mu2, mu3) < 0:
-        raise ValueError("Regularization coefficients must be nonnegative.")
+    if harmonic_mask is not None:
+        mask = tf.convert_to_tensor(
+            harmonic_mask, dtype=tf.float32
+        )
 
-    if max_iter < 1:
-        raise ValueError("max_iter must be positive.")
+        tf.debugging.assert_equal(
+            tf.shape(mask), tf.stack([F, K])
+        )
 
-    if tol < 0:
-        raise ValueError("tol must be nonnegative.")
+        tf.debugging.assert_greater_equal(mask, 0.0)
+        tf.debugging.assert_less_equal(mask, 1.0)
+    else:
+        mask = tf.ones((F, K), dtype=tf.float32)
 
-    if eps <= 0:
-        raise ValueError("eps must be positive.")
-
-    update = update.lower()
-
-    if update not in ("both", "h", "w"):
-        raise ValueError("update must be 'both', 'H' or 'W'.")
-
-    # -------------------------------------------------------
-    # Divergence parameter
-    # -------------------------------------------------------
-
-    if r is None:
-        divergence_map = {
-            "euclidean": 0.0,
-            "kl": 1.0,
-            "is": 2.0,
-            "itakura-saito": 2.0,
-        }
-
-        if divergence.lower() not in divergence_map:
-            raise ValueError(
-                "divergence must be 'euclidean', 'kl' or 'is'."
-            )
-
-        r = divergence_map[divergence.lower()]
-
-    r = float(r)
-
-    if not 0 <= r <= 2:
-        raise ValueError("r must belong to [0, 2].")
-
-    # -------------------------------------------------------
+    # --------------------------------------------------
     # Initialization
-    # -------------------------------------------------------
+    # --------------------------------------------------
 
-    rng = np.random.default_rng(random_state)
-
-    if W_init is None:
-        if n_components is None:
-            raise ValueError(
-                "Provide either n_components or W_init."
-            )
-
-        K = int(n_components)
-
-        if K < 1:
-            raise ValueError("n_components must be positive.")
-
-        W = rng.random((F, K)) + eps
-
+    if A_init is None:
+        A = tf.random.uniform(
+            (F, K),
+            minval=0.01,
+            maxval=1.0,
+            dtype=tf.float32,
+            seed=seed
+        )
     else:
-        W = np.asarray(W_init, dtype=np.float64).copy()
+        A = tf.convert_to_tensor(
+            A_init, dtype=tf.float32
+        )
 
-        if W.ndim != 2 or W.shape[0] != F:
-            raise ValueError("W_init has an incompatible shape.")
+        tf.debugging.assert_equal(
+            tf.shape(A), tf.stack([F, K])
+        )
 
-        K = W.shape[1]
-
-        if n_components is not None and n_components != K:
-            raise ValueError(
-                "n_components does not match W_init."
-            )
-
-        if np.any(W < 0) or not np.all(np.isfinite(W)):
-            raise ValueError("W_init must be finite and nonnegative.")
-
-    if H_init is None:
-        H = None
-
+    if S_init is None:
+        S = tf.random.uniform(
+            (K, T),
+            minval=0.01,
+            maxval=1.0,
+            dtype=tf.float32,
+            seed=seed
+        )
     else:
-        H = np.asarray(H_init, dtype=np.float64).copy()
+        S = tf.convert_to_tensor(
+            S_init, dtype=tf.float32
+        )
 
-        if H.shape != (K, T):
-            raise ValueError(
-                f"H_init must have shape ({K}, {T})."
+        tf.debugging.assert_equal(
+            tf.shape(S), tf.stack([K, T])
+        )
+
+    tf.debugging.assert_greater_equal(A, 0.0)
+    tf.debugging.assert_greater_equal(S, 0.0)
+
+    A = A * mask
+
+    # --------------------------------------------------
+    # Shift operators
+    # --------------------------------------------------
+    
+    @tf.function
+    def shift_down_right(M):
+        return tf.pad(
+            M[:-shift_bins, :-1],
+            [[shift_bins, 0], [1, 0]]
+        )
+    
+    @tf.function
+    def shift_up_left(M):
+        return tf.pad(
+            M[shift_bins:, 1:],
+            [[0, shift_bins], [0, 1]]
+        )
+    
+    @tf.function
+    def shift_adjoint_product(M):
+        return tf.pad(
+            M[:-shift_bins, :-1],
+            [[0, shift_bins], [0, 1]]
+        )
+
+    # --------------------------------------------------
+    # Compiled optimization
+    # --------------------------------------------------
+
+    @tf.function(reduce_retracing=True)
+    def optimize(X, A, S):
+
+        def cond(i, A, S):
+            return i < max_iter
+
+        def body(i, A, S):
+
+            # ------------------------------------------
+            # Update A
+            # ------------------------------------------
+
+            # Euclidean NMF gradient:
+            # A @ S @ S.T - X @ S.T
+
+            numerator_A = tf.matmul(
+                X, S, transpose_b=True
             )
 
-        if np.any(H < 0) or not np.all(np.isfinite(H)):
-            raise ValueError("H_init must be finite and nonnegative.")
-
-    # -------------------------------------------------------
-    # Basis normalization
-    # -------------------------------------------------------
-
-    if normalize_W:
-        scales = np.maximum(np.linalg.norm(W, axis=0), eps)
-
-        W /= scales[None, :]
-
-        if H is not None:
-            H *= scales[:, None]
-
-    if H is None:
-        H = rng.random((K, T)) + eps
-
-    # -------------------------------------------------------
-    # Cross-correlation weights
-    # -------------------------------------------------------
-
-    C = None
-
-    if mu2 > 0:
-        if cross_weights is None:
-            raise ValueError(
-                "cross_weights must be provided when mu2 > 0."
+            denominator_A = tf.matmul(
+                A,
+                tf.matmul(S, S, transpose_b=True)
             )
 
-        C = np.asarray(cross_weights, dtype=np.float64).copy()
+            # Regularization gradient:
+            #
+            # grad = A - T(A) - T*(A) + T*T(A)
+            #
+            # Split into positive and negative parts.
 
-        if C.shape != (K, K):
-            raise ValueError(
-                f"cross_weights must have shape ({K}, {K})."
+            T_A = shift_down_right(A)
+            T_star_A = shift_up_left(A)
+            T_star_T_A = shift_adjoint_product(A)
+
+            grad_positive = A + T_star_T_A
+            grad_negative = T_A + T_star_A
+
+            numerator_A += lam * grad_negative
+            denominator_A += lam * grad_positive
+
+            A = A * (
+                numerator_A /
+                (denominator_A + eps)
             )
 
-        if not np.all(np.isfinite(C)) or np.any(C < 0):
-            raise ValueError(
-                "cross_weights must be finite and nonnegative."
+            A = tf.maximum(A, 0.0)
+            A = A * mask
+
+            # ------------------------------------------
+            # Update S
+            # ------------------------------------------
+
+            numerator_S = tf.matmul(
+                A, X, transpose_a=True
             )
 
-        if not np.allclose(C, C.T, atol=1e-8):
-            raise ValueError("cross_weights must be symmetric.")
-
-        C = 0.5 * (C + C.T)
-        np.fill_diagonal(C, 0.0)
-
-    # -------------------------------------------------------
-    # Temporal weights
-    # -------------------------------------------------------
-
-    V = None
-
-    if mu3 > 0:
-        if temporal_weights is None:
-            raise ValueError(
-                "temporal_weights must be provided when mu3 > 0."
+            denominator_S = tf.matmul(
+                tf.matmul(A, A, transpose_a=True),
+                S
             )
 
-        V = np.asarray(
-            temporal_weights,
-            dtype=np.float64
-        ).copy()
-
-        if not np.all(np.isfinite(V)) or np.any(V < 0):
-            raise ValueError(
-                "temporal_weights must be finite and nonnegative."
+            S = S * (
+                numerator_S /
+                (denominator_S + eps)
             )
 
-        if V.ndim == 1:
-            # V[d] represents the weight for temporal lag d.
-            V[0] = 0.0
+            S = tf.maximum(S, 0.0)
 
-        elif V.ndim == 2:
-            if V.shape != (T, T):
-                raise ValueError(
-                    f"2D temporal_weights must have shape ({T}, {T})."
-                )
+            return i + 1, A, S
 
-            if not np.allclose(V, V.T, atol=1e-8):
-                raise ValueError(
-                    "A dense temporal weighting matrix must be symmetric."
-                )
+        _, A, S = tf.while_loop(
+            cond,
+            body,
+            (tf.constant(0), A, S),
+            parallel_iterations=1
+        )
 
-            V = 0.5 * (V + V.T)
-            np.fill_diagonal(V, 0.0)
+        return A, S
 
-        else:
-            raise ValueError(
-                "temporal_weights must be 1D or 2D."
-            )
+    A, S = optimize(X, A, S)
 
-    # -------------------------------------------------------
-    # Objective function
-    # -------------------------------------------------------
+    # --------------------------------------------------
+    # Return results
+    # --------------------------------------------------
 
-    def calculate_objective(W, H):
+    if return_loss:
+        reconstruction = tf.matmul(A, S)
 
-        Y = np.maximum(W @ H, eps)
+        reconstruction_loss = 0.5 * tf.reduce_sum(
+            tf.square(X - reconstruction)
+        )
 
-        loss = _beta_divergence(X, Y, r, eps)
+        harmonic_loss = 0.5 * lam * tf.reduce_sum(
+            tf.square(A - shift_down_right(A))
+        )
 
-        # Sparsity penalty
-        if mu1 > 0:
-            loss += mu1 * np.sum(H ** p)
+        loss = reconstruction_loss + harmonic_loss
 
-        # Cross-correlation penalty
-        if mu2 > 0:
-            loss += mu2 * np.sum(C * (H @ H.T))
+        return A.numpy(), S.numpy(), float(loss.numpy())
 
-        # Temporal penalty
-        if mu3 > 0:
-            HV = _temporal_product(H, V)
+    return A.numpy(), S.numpy()
 
-            beta3 = -mu3 * np.sum(H * HV)
 
-            if temporal_exponential:
-                loss += np.exp(np.clip(beta3, -50.0, 50.0))
-            else:
-                loss += beta3
-
-        return float(loss)
-
-    # -------------------------------------------------------
-    # Multiplicative optimization
-    # -------------------------------------------------------
-
-    history = []
-
-    previous_loss = None
-
-    for iteration in range(max_iter):
-
-        # ===============================================
-        # Update W
-        # ===============================================
-
-        if update in ("both", "w"):
-
-            Y = np.maximum(W @ H, eps)
-
-            X_weighted = X * Y ** (-r)
-            Y_weighted = Y ** (1.0 - r)
-
-            numerator_W = X_weighted @ H.T
-            denominator_W = Y_weighted @ H.T
-
-            W *= (
-                np.maximum(numerator_W, eps)
-                / np.maximum(denominator_W, eps)
-            )
-
-            # Normalize basis and transfer its scale to H.
-            if normalize_W:
-                scales = np.maximum(
-                    np.linalg.norm(W, axis=0),
-                    eps
-                )
-
-                W /= scales[None, :]
-                H *= scales[:, None]
-
-        # ===============================================
-        # Update H
-        # ===============================================
-
-        if update in ("both", "h"):
-
-            Y = np.maximum(W @ H, eps)
-
-            X_weighted = X * Y ** (-r)
-            Y_weighted = Y ** (1.0 - r)
-
-            numerator_H = W.T @ X_weighted
-            denominator_H = W.T @ Y_weighted
-
-            # -------------------------------------------
-            # 1. Sparsity regularization
-            # -------------------------------------------
-
-            if mu1 > 0:
-
-                sparsity_gradient = (
-                    mu1 * p * np.maximum(H, eps) ** (p - 1.0)
-                )
-
-                denominator_H += sparsity_gradient
-
-            # -------------------------------------------
-            # 2. Cross-correlation regularization
-            # -------------------------------------------
-
-            if mu2 > 0:
-
-                cross_gradient = 2.0 * mu2 * (C @ H)
-
-                denominator_H += cross_gradient
-
-            # -------------------------------------------
-            # 3. Temporal regularization
-            # -------------------------------------------
-
-            if mu3 > 0:
-
-                HV = _temporal_product(H, V)
-
-                beta3 = -mu3 * np.sum(H * HV)
-
-                if temporal_exponential:
-                    temporal_scale = np.exp(
-                        np.clip(beta3, -50.0, 50.0)
-                    )
-                else:
-                    temporal_scale = 1.0
-
-                # The gradient is negative:
-                #
-                # grad(beta3) = -2 * mu3 * H @ V
-                #
-                # Therefore, its magnitude is added to
-                # the numerator of the multiplicative update.
-
-                numerator_H += (
-                    2.0 * mu3 * temporal_scale * HV
-                )
-
-            # -------------------------------------------
-            # Multiplicative update
-            # -------------------------------------------
-
-            H *= (
-                np.maximum(numerator_H, eps)
-                / np.maximum(denominator_H, eps)
-            )
-
-        # ===============================================
-        # Evaluate objective
-        # ===============================================
-
-        current_loss = calculate_objective(W, H)
-
-        history.append(current_loss)
-
-        if previous_loss is not None and tol > 0:
-
-            relative_change = (
-                abs(previous_loss - current_loss)
-                / max(abs(previous_loss), eps)
-            )
-
-            if relative_change < tol:
-                break
-
-        previous_loss = current_loss
-
-    if return_history:
-        return W, H, np.asarray(history)
-
-    return W, H
-
-def norm_log(H, gamma=5):
-    return np.log1p(gamma * H)
-
-def build_W0(
-    sr,
-    bins_per_octave,
+def build_hnma_mask(
     n_bins,
-    fmin,
+    n_components=88,
+    fmin=27.5,
+    bins_per_octave=36,
+    midi_min=21,
     n_harmonics=10,
-    decay=1.0,
-    sigma=1.5,
-    inharmonicity=0.0,
 ):
-    # CQT frequency grid: must match your spectrogram
-    freqs = librosa.cqt_frequencies(
-        n_bins=n_bins,
-        fmin=fmin,
-        bins_per_octave=bins_per_octave,
+    """
+    Construct a binary harmonic support mask.
+
+    Returns:
+        mask: (n_bins, n_components)
+    """
+
+    mask = np.zeros(
+        (n_bins, n_components),
+        dtype=np.float32
     )
 
-    # Log-frequency coordinates corresponding to CQT bins
-    log_freqs = np.log2(freqs)
-    k = np.arange(n_bins, dtype=float)
+    midi_notes = np.arange(
+        midi_min,
+        midi_min + n_components
+    )
 
-    # Piano pitches: MIDI 21 (A0) through MIDI 108 (C8)
-    midi_notes = np.arange(21, 109)
+    for k, midi in enumerate(midi_notes):
 
-    W0 = np.zeros((n_bins, len(midi_notes)), dtype=float)
-
-    f_max = min(freqs[-1], sr / 2.0)
-
-    for i, m in enumerate(midi_notes):
-        f0 = librosa.midi_to_hz(m)
-        template = np.zeros(n_bins, dtype=float)
+        f0 = 440.0 * 2.0 ** ((midi - 69) / 12.0)
 
         for h in range(1, n_harmonics + 1):
 
-            # Harmonic frequency, optionally including piano
-            # string inharmonicity.
-            fh = h * f0 * np.sqrt(
-                (1.0 + inharmonicity * h**2)
-                / (1.0 + inharmonicity)
-            )
+            freq = h * f0
 
-            # CRITICAL FIX:
-            # Never map out-of-range harmonics onto the
-            # first or last CQT bin.
-            if fh >= f_max:
-                break
-
-            if fh < freqs[0]:
+            if freq < fmin:
                 continue
 
-            # Fractional bin coordinate in log-frequency space
-            center = np.interp(
-                np.log2(fh),
-                log_freqs,
-                k,
-            )
+            bin_idx = int(np.rint(
+                bins_per_octave *
+                np.log2(freq / fmin)
+            ))
 
-            # Gaussian harmonic peak
-            peak = np.exp(
-                -0.5 * ((k - center) / sigma) ** 2
-            )
+            if 0 <= bin_idx < n_bins:
+                mask[bin_idx, k] = 1.0
 
-            template += peak / (h ** decay)
+    return mask
 
-        # L2 normalization
-        norm = np.linalg.norm(template)
-        if norm > 1e-10:
-            template /= norm
-
-        W0[:, i] = template
-
-    return W0
-
-def build_noise_basis(n_bins, n_components=2):
-    Wn = np.zeros((n_bins, n_components))
-
-    for i in range(n_components):
-        # random smooth noise shape
-        x = np.random.rand(n_bins)
-        x = np.convolve(x, np.hanning(15), mode='same')
-        x /= np.linalg.norm(x) + 1e-10
-        Wn[:, i] = x
-
-    return Wn
+def norm_log(H, gamma=5):
+    return np.log1p(gamma * H)
 
 def med_filter(X, sz=5):
   X_r = np.zeros(X.shape)
@@ -832,9 +451,9 @@ def evaluate_results(H_et,H):
     TP += sum(1 for t, p in zip(H_et[:,i], H[:,i]) if t == 1 and p == 1)
     FP += sum(1 for t, p in zip(H_et[:,i], H[:,i]) if t == 0 and p == 1)
     FN += sum(1 for t, p in zip(H_et[:,i], H[:,i]) if t == 1 and p == 0)
-  P = TP / (TP + FP)
-  R = TP / (TP + FN)
-  F1 = 2 * P * R / (P + R)
+  P = TP / (TP + FP + 1e-10)
+  R = TP / (TP + FN + 1e-10)
+  F1 = 2 * P * R / (P + R + 1e-10)
   return (P,R,F1)
 
 def read_wav_as_float(file_path):
@@ -860,7 +479,10 @@ def read_wav_as_float(file_path):
     return sr, np.ascontiguousarray(x)
 
 def get_files(extension):
-    return [str(file) for file in Path.cwd().rglob("*."+extension)]
+    return sorted(
+        str(file)
+        for file in Path.cwd().rglob(f"*.{extension}")
+    )
 
 def midi_to_cqt_labels(
     midi_input,
@@ -949,47 +571,52 @@ def midi_to_cqt_labels(
 
     return B
 
+def mycustomloss(y_true, y_pred):
+
+    epsilon = tf.keras.backend.epsilon()
+
+    axes = [1]  # Sum over pitches
+
+    TP = tf.reduce_sum(
+        y_true * y_pred, axis=axes
+    )
+
+    FP = tf.reduce_sum(
+        (1.0 - y_true) * y_pred, axis=axes
+    )
+
+    FN = tf.reduce_sum(
+        y_true * (1.0 - y_pred), axis=axes
+    )
+
+    F1 = (
+        2.0 * TP /
+        (2.0 * TP + FP + FN + epsilon)
+    )
+
+    return tf.reduce_mean(1.0 - F1)
+
 def build_convnet(
-    K=5,
     context_frames=5,
     n_pitches=88,
     target_mode="binary",
     learning_rate=1e-3
 ):
     """
-    Build the CNN for automatic music transcription.
+    CNN-based NMF activation postprocessing.
 
-    Parameters
-    ----------
-    K : int
-        Number of frequency bins per MIDI pitch.
-        Input frequency dimension = 88 * K.
+    Input:
+        NMF context: (context_frames, n_pitches, 1)
 
-        For K=5, input shape is (5, 440, 1).
+    Output:
+        Masked center-frame activations: (n_pitches,)
 
-    context_frames : int
-        Number of consecutive spectrogram frames.
-
-    n_pitches : int
-        Number of output pitches. Default: 88.
-
-    target_mode : str
-        "binary"     - binary piano-roll targets, BCE loss.
-        "continuous" - continuous targets in [0, 1], MSE loss.
-
-    learning_rate : float
-        Adam learning rate.
-
-    Returns
-    -------
-    model : tf.keras.Model
+        Y_hat = H_center * CNN(H_context)
     """
 
-    n_bins = n_pitches * K
-
     inputs = tf.keras.Input(
-        shape=(context_frames, n_bins, 1),
-        name="spectrogram_input"
+        shape=(context_frames, n_pitches, 1),
+        name="nmf_input"
     )
 
     # First convolutional block
@@ -1056,23 +683,37 @@ def build_convnet(
         name="dropout3"
     )(x)
 
-    # Output: probability or normalized activation for each pitch
-    outputs = tf.keras.layers.Dense(
+    # Estimate mask
+    mask = tf.keras.layers.Dense(
         n_pitches,
         activation="sigmoid",
-        name="pitch_output"
+        name="mask_output"
     )(x)
+
+    # Extract center frame from original NMF context
+    center_index = context_frames // 2
+
+    center_activations = tf.keras.layers.Lambda(
+        lambda t: t[:, center_index, :, 0],
+        name="center_frame"
+    )(inputs)
+
+    # Multiplicative masking
+    outputs = tf.keras.layers.Multiply(
+        name="multiplicative_mask"
+    )([center_activations, mask])
 
     model = tf.keras.Model(
         inputs=inputs,
-        outputs=outputs,
-        name="ConvNet_AMT"
+        outputs=mask,
+        name="NMF_Masked_ConvNet"
     )
 
     # Compile
     if target_mode == "binary":
 
-        loss = tf.keras.losses.BinaryFocalCrossentropy(gamma=2.0)
+        loss = tf.keras.losses.BinaryCrossentropy()
+
         metrics = [
             tf.keras.metrics.BinaryAccuracy(
                 name="binary_accuracy"
@@ -1105,7 +746,8 @@ def build_convnet(
         optimizer=tf.keras.optimizers.Adam(
             learning_rate=learning_rate
         ),
-        loss=loss,
+        #loss=mycustomloss,
+	loss=loss,
         metrics=metrics
     )
 
@@ -1229,7 +871,6 @@ def train_convnet(
     model.save(output_path)
 
     return history
-
 def make_context_dataset(
     spectrogram,
     piano_roll,
@@ -1309,7 +950,6 @@ def make_context_dataset(
     )
 
     return X, piano_roll
-
 def tracks_to_dataset(
     tracks,
     context_frames=5
@@ -1352,21 +992,6 @@ def tracks_to_dataset(
         np.concatenate(X_list, axis=0),
         np.concatenate(y_list, axis=0)
     )
-
-midi_notes = np.arange(21, 109)
-C = make_pitch_cross_weights(midi_notes, interval_weights={
-            0: 1.0,   # Octaves
-            4: 0.5,   # Major thirds
-            7: 0.5,   # Perfect fifths
-        }
-    )
-    
-V = exponential_temporal_weights(
-        radius=5,
-        decay=2.0,
-        normalize=True
-    )
-
 def extract_binary_data():
   l = get_files("wav")
   #print(l)
@@ -1378,39 +1003,24 @@ def extract_binary_data():
   data = []
   for file_name_string_audio in l:
     f_s, x = read_wav_as_float(file_name_string_audio)
-    W_0 = build_W0(sr=f_s, bins_per_octave=12*K, n_bins=88 * K+L, fmin=librosa.note_to_hz('A0'), sigma=1.75)
-    #Wn = build_noise_basis(88*K+L, 1)
-    #W_0 = np.concatenate([W_0, Wn], axis=1)
     spectrogram = np.abs(librosa.cqt(x,sr=f_s, fmin=librosa.note_to_hz('A0'), bins_per_octave=12 * K, n_bins=88 * K+L, hop_length=HOP, sparsity=0.05))
     #spectrogram = norm_log(spectrogram, g)
-    spectrogram = librosa.util.normalize(spectrogram, norm = 2, axis = 0, threshold = 0.05)
-    W, H, history = regularized_nmf(
+    #spectrogram = librosa.util.normalize(spectrogram, norm = 2, axis = 0, threshold = 0.05)
+    mask = build_hnma_mask(
+        n_bins=88 * K,
+        n_components=88,
+        fmin=27.5,
+        bins_per_octave=12 * K,
+        midi_min=21,
+        n_harmonics=10
+    )
+    W, H = hnma_tf(
         spectrogram,
         n_components=88,
-    
-        W_init=W_0,
-    
-        divergence="kl",
-    
-        # Sparsity
-        mu1=1e-3,
-        p=1.0,
-    
-        # Cross-correlation
-        #mu2=0.01,
-        #cross_weights=C,
-    
-        # Temporal smoothness
-        #mu3=0.001,
-        #temporal_weights=V,
-    
-        # Keep the harmonic dictionary fixed
-        update="both",
-    
-        max_iter=300,
-        tol=1e-5,
-    
-        return_history=True
+        harmonic_mask=mask,
+        lambda_A=10,
+        shift_bins=2*K,
+        max_iter=500
     )
     B = midi_to_cqt_labels(
       file_name_string_audio[:-3]+"mid",
@@ -1419,18 +1029,16 @@ def extract_binary_data():
       hop_length=HOP,
       mode="binary"
     )
-    #print(H.shape[1],B.shape[1])
-    data.append((H,B))
+    print(H.shape[1],B.shape[1])
+    data.append((H[0:88,:],B))
     del x, spectrogram
-    del W, H, B, history
+    del W, H, B
   return data
 
 my_file = Path("./traindata.npz")
-
 if my_file.is_file():
     model = build_convnet(
-        K=1,
-        context_frames=FRAMES_NUM,
+        context_frames=CONTEXT_FRAMES,
         n_pitches=88,
         target_mode="binary",
         learning_rate=1e-5
@@ -1444,7 +1052,6 @@ if my_file.is_file():
     )
     
     data = [loaded[key] for key in data_keys]
-    
     H = loaded["H"]
     H1 = med_filter(H,sz=9)
     #H1 = med_filter(H)
@@ -1455,8 +1062,7 @@ if my_file.is_file():
     t = H3.max() * 0.125
     H4 = (H3 > t).astype(int)
     H5 = enforce_min_duration(H4,min_len=15)[0:88,:]
-    f_s = read_wav_as_float("Prelude-in-E-Minor-Nr-4.wav")[0]
-    M = midi_to_cqt_labels("Prelude-in-E-Minor-Nr-4.mid", H.shape[1], f_s, HOP)
+    M = midi_to_cqt_labels("Prelude-in-E-Minor-Nr-4.mid", H.shape[1], 44100, HOP)
     #z = analyse_spectrogram(spectrogram, onsets)
     #H6 = clear_H(H5,onsets,z)
     plt.figure()
@@ -1479,7 +1085,7 @@ else:
     onsets = librosa.onset.onset_detect(y=x, sr=f_s, hop_length=HOP,units='frames')
 
     #spectrogram = norm_log(spectrogram, g)
-    spectrogram = librosa.util.normalize(spectrogram, norm = 2, axis = 0, threshold = 0.05)
+    #spectrogram = librosa.util.normalize(spectrogram, norm = 2, axis = 0, threshold = 0.05)
 
     plt.figure()
     plt.imshow(spectrogram, aspect='auto', origin='lower')
@@ -1489,42 +1095,22 @@ else:
     plt.ylabel("Pitch / Component index")
     plt.show()
 
-    W_0 = np.load("res.npy")
-    plt.figure()
-    plt.imshow(spectrogram, aspect='auto', origin='lower')
-    plt.colorbar()
-    plt.title("Activation matrix W")
-    plt.xlabel("Time frames")
-    plt.ylabel("Pitch / Component index")
-    plt.show()
-
-    W, H, history = regularized_nmf(
+    mask = build_hnma_mask(
+        n_bins=88 * K,
+        n_components=88,
+        fmin=27.5,
+        bins_per_octave=12 * K,
+        midi_min=21,
+        n_harmonics=10
+    )
+    
+    W, H = hnma_tf(
         spectrogram,
         n_components=88,
-    
-        W_init=W_0,
-    
-        divergence="kl",
-    
-        # Sparsity
-        mu1=1e-3,
-        p=1.0,
-    
-        # Cross-correlation
-        #mu2=0.01,
-        #cross_weights=C,
-    
-        # Temporal smoothness
-        #mu3=0.001,
-        #temporal_weights=V,
-    
-        # Keep the harmonic dictionary fixed
-        update="both",
-    
-        max_iter=300,
-        tol=1e-5,
-    
-        return_history=True
+        harmonic_mask=mask,
+        lambda_A=10,
+        shift_bins=2*K,
+        max_iter=500
     )
     
     V_hat = W @ H
@@ -1580,7 +1166,7 @@ else:
     l = get_files("")
     print(l)
 
-    M = midi_to_cqt_labels("Prelude-in-E-Minor-Nr-4.mid", H.shape[1], f_s, HOP)
+    M = midi_to_cqt_labels("Prelude-in-E-Minor-Nr-4.mid", H.shape[1], 44100, HOP)
 
     plt.imshow(M, aspect='auto', origin='lower')
     plt.colorbar()
@@ -1609,8 +1195,7 @@ else:
     print(H.shape)
 
     model = build_convnet(
-        K=1,
-        context_frames=FRAMES_NUM,
+        context_frames=CONTEXT_FRAMES,
         n_pitches=88,
         target_mode="binary",
         learning_rate=1e-5
@@ -1618,7 +1203,8 @@ else:
 
     model.summary()
     data = extract_binary_data()
-    random.shuffle(data)
+    rng = random.Random(42)
+    rng.shuffle(data)
     save_dict = {
         f"data_{i}": matrix
         for i, matrix in enumerate(data)
@@ -1628,17 +1214,17 @@ else:
     
     np.savez("traindata.npz", **save_dict)
 
-train_tracks = [(l[0].T,l[1].T) for l in data[0:(len(data)*3)//8]]
-val_tracks = [(l[0].T,l[1].T) for l in data[(len(data)*3)//8:(len(data)*4)//8]]
+train_tracks = [(l[0].T,l[1].T) for l in data[0:(len(data)*6)//8]]
+val_tracks = [(l[0].T,l[1].T) for l in data[(len(data)*6)//8:(len(data)*8)//8]]
 
 X_train, y_train = tracks_to_dataset(
     train_tracks,
-    context_frames=FRAMES_NUM
+    context_frames=CONTEXT_FRAMES
 )
 
 X_val, y_val = tracks_to_dataset(
     val_tracks,
-    context_frames=FRAMES_NUM
+    context_frames=CONTEXT_FRAMES
 )
 
 print("Training input:", X_train.shape)
