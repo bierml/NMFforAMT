@@ -187,12 +187,7 @@ H = data["H"]
 print("Input shape:", model.input_shape)
 print("Output shape:", model.output_shape)
 
-'''workflow = []
-for i in range(2,H.shape[1]-2):
-    workflow.append(model.predict(H[:88,i-2:i+3].reshape(1,5,88,1),verbose=0))
-workflow = np.array(workflow)
-workflow = workflow.reshape(workflow.shape[0],88)
-binary_piano_roll = (workflow >= 0.1).astype(np.uint8).T'''
+
 #H_f = H[:88,:(H.shape[1]//5)*5].T
 #predictions = model.predict(H_f.reshape(H_f.shape[0] // 5, 5, 88,1))
 #binary_piano_roll = (predictions >= 0.1).astype(np.uint8).T
@@ -247,3 +242,4 @@ plt.xlabel("Time frames")
 plt.ylabel("Pitch / Component index")
 plt.show()
 print(evaluate_results(M[:,CONTEXT_FRAMES//2:-(CONTEXT_FRAMES//2)],binary_piano_roll))
+np.savez("piano_roll.npz", workflow=workflow, piano_roll=binary_piano_roll)

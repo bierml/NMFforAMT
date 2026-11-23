@@ -48,6 +48,15 @@ def normalize_piano_roll(H, gamma=5.0):
 
     return H
 
+def normalize_NMF(W,H):
+  W_c = W.copy()
+  H_c = H.copy()
+  for i in range(W_c.shape[1]):
+    c = np.sum(W_c[:,i])
+    W_c[:,i] /= c 
+    H_c[i,:] *= c
+  return (W_c,H_c)
+
 def hnma_tf(
     X,
     n_components,
@@ -1034,6 +1043,7 @@ def extract_binary_data():
         shift_bins=K,
         max_iter=500
     )
+    H = normalize_NMF(W,H)[1]
     B = midi_to_cqt_labels(
       file_name_string_audio[:-3]+"mid",
       n_frames=H.shape[1],
@@ -1078,6 +1088,7 @@ if my_file.is_file():
     M = midi_to_cqt_labels("Prelude-in-E-Minor-Nr-4.mid", H.shape[1], 44100, HOP)
     #z = analyse_spectrogram(spectrogram, onsets)
     #H6 = clear_H(H5,onsets,z)
+    H = normalize_NMF(W,H)[1]
     H = norm_log(H,5)
     plt.figure()
     plt.imshow(H5, aspect='auto', origin='lower')
@@ -1128,6 +1139,7 @@ else:
     )
     
     V_hat = W @ H
+    H = normalize_NMF(W,H)[1]
     H = norm_log(H,5)
     print("W:", W.shape)
     print("H:", H.shape)
@@ -1180,7 +1192,7 @@ else:
     l = get_files("")
     print(l)
 
-    M = midi_to_cqt_labels("Prelude-in-E-Minor-Nr-4.mid", H.shape[1], 44100, HOP)
+    M = midi_to_cqt_labels("Prelude-in-E-Minor-Nr-4.mid", H.shape[1], f_s, HOP)
 
     plt.imshow(M, aspect='auto', origin='lower')
     plt.colorbar()
@@ -1292,4 +1304,3 @@ plt.grid()
 plt.show()
 
 np.savez("res_data.npz", M=M, H=H)
-
