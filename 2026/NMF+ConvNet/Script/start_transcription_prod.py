@@ -1031,7 +1031,7 @@ def extract_binary_data():
         n_components=88,
         harmonic_mask=mask,
         lambda_A=10,
-        shift_bins=2*K,
+        shift_bins=K,
         max_iter=500
     )
     B = midi_to_cqt_labels(
@@ -1123,7 +1123,7 @@ else:
         n_components=88,
         harmonic_mask=mask,
         lambda_A=10,
-        shift_bins=2*K,
+        shift_bins=K,
         max_iter=500
     )
     
