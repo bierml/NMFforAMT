@@ -57,287 +57,445 @@ def normalize_NMF(W,H):
     H_c[i,:] *= c
   return (W_c,H_c)
 
-def hnma_tf(
+def _tf_temporal_product(H, V):
+    """TensorFlow equivalent of the NumPy _temporal_product helper."""
+    if V.shape.rank == 1:
+        T = H.shape[1]
+        result = tf.zeros_like(H)
+
+        # V[lag] is the weight for both directions at temporal lag `lag`.
+        for lag in range(1, min(int(V.shape[0]), int(T))):
+            weight = V[lag]
+            left = tf.concat(
+                [tf.zeros_like(H[:, :lag]), weight * H[:, :-lag]],
+                axis=1,
+            )
+            right = tf.concat(
+                [weight * H[:, lag:], tf.zeros_like(H[:, :lag])],
+                axis=1,
+            )
+            result = result + left
+            result = result + right
+
+        return result
+
+    return tf.matmul(H, V)
+
+def _tf_beta_divergence(X, Y, r, eps):
+    """Bregman divergence for phi''(x) = x**(-r), as in the NumPy version."""
+    Y = tf.maximum(Y, eps)
+
+    if np.isclose(r, 0.0):
+        return 0.5 * tf.reduce_sum(tf.square(X - Y))
+
+    if np.isclose(r, 1.0):
+        positive = X > 0.0
+        safe_ratio = tf.where(positive, X / Y, tf.ones_like(X))
+        x_log_ratio = tf.where(
+            positive,
+            X * tf.math.log(safe_ratio),
+            tf.zeros_like(X),
+        )
+        return tf.reduce_sum(x_log_ratio - X + Y)
+
+    if np.isclose(r, 2.0):
+        X_safe = tf.maximum(X, eps)
+        ratio = X_safe / Y
+        return tf.reduce_sum(ratio - tf.math.log(ratio) - 1.0)
+
+    beta = 2.0 - r
+    return tf.reduce_sum(
+        (
+            tf.pow(X, beta)
+            + (beta - 1.0) * tf.pow(Y, beta)
+            - beta * X * tf.pow(Y, beta - 1.0)
+        )
+        / (beta * (beta - 1.0))
+    )
+
+def regularized_nmf_tf(
     X,
-    n_components,
+    n_components=None,
     *,
-    A_init=None,
-    S_init=None,
-    harmonic_mask=None,
-    lambda_A=1.0,
-    shift_bins=1,  # NEW
+    W_init=None,
+    H_init=None,
+    # Divergence
+    divergence="euclidean",
+    r=None,
+    # Sparsity regularization
+    mu1=0.0,
+    p=1.0,
+    # Cross-correlation regularization
+    mu2=0.0,
+    cross_weights=None,
+    # Temporal regularization
+    mu3=0.0,
+    temporal_weights=None,
+    temporal_exponential=False,
+    # Optimization
+    update="both",
+    normalize_W=True,
     max_iter=300,
-    eps=1e-9,
-    seed=None,
-    return_loss=False,
+    tol=1e-5,
+    random_state=None,
+    eps=1e-10,
+    return_history=False,
 ):
     """
-    Harmonic Nonnegative Matrix Approximation (HNMA).
+    TensorFlow/GPU implementation of regularized NMF.
 
-    Based on:
-        Raczynski, Ono, Sagayama (MIREX 2007).
+    The public arguments, defaults, update equations, initialization,
+    convergence test, and return structure match regularized_nmf() from
+    the NumPy implementation. Computation uses float64 to minimize
+    numerical differences from that implementation.
 
-    Objective:
-        0.5 * ||X - A @ S||_F^2
-        + 0.5 * lambda_A * ||A - T(A)||_F^2
-
-    where T(A) shifts A down by one frequency bin
-    and right by one component.
-
-    Parameters
-    ----------
-    X : array-like, shape (F, T)
-        Nonnegative input spectrogram.
-
-    n_components : int
-        Number of basis vectors.
-
-    A_init : array-like, optional, shape (F, K)
-        Initial basis matrix.
-
-    S_init : array-like, optional, shape (K, T)
-        Initial activation matrix.
-
-    harmonic_mask : array-like, optional, shape (F, K)
-        Binary mask defining allowed basis frequencies.
-        Zeros remain zeros throughout optimization.
-
-    lambda_A : float
-        Strength of harmonic similarity regularization.
-
-    max_iter : int
-        Number of iterations.
-
-    eps : float
-        Numerical stability constant.
-
-    seed : int, optional
-        Random initialization seed.
-
-    return_loss : bool
-        Return final objective value if True.
-
-    Returns
-    -------
-    A : np.ndarray, shape (F, K)
-    S : np.ndarray, shape (K, T)
-    loss : float, optional
+    Parameters and return values have the same meaning as regularized_nmf.
+    W and H are returned as NumPy float64 arrays.
     """
+    # -------------------------------------------------------
+    # Input validation (kept equivalent to the NumPy version)
+    # -------------------------------------------------------
+    X_np = np.asarray(X, dtype=np.float64)
 
-    # --------------------------------------------------
-    # Input preparation
-    # --------------------------------------------------
+    if X_np.ndim != 2:
+        raise ValueError("X must be a two-dimensional matrix.")
 
-    X = tf.convert_to_tensor(X, dtype=tf.float32)
+    if not np.all(np.isfinite(X_np)):
+        raise ValueError("X contains NaN or infinite values.")
 
-    tf.debugging.assert_rank(X, 2)
-    tf.debugging.assert_all_finite(X, "X contains NaN or Inf")
-    tf.debugging.assert_greater_equal(X, 0.0)
+    if np.any(X_np < 0):
+        raise ValueError("X must be nonnegative.")
 
-    F = tf.shape(X)[0]
-    T = tf.shape(X)[1]
-    K = n_components
+    F, T = X_np.shape
 
-    if K < 1:
-        raise ValueError("n_components must be positive.")
+    if F == 0 or T == 0:
+        raise ValueError("X must not have empty dimensions.")
 
-    if lambda_A < 0:
-        raise ValueError("lambda_A must be nonnegative.")
+    if not 0 < p < 2:
+        raise ValueError("p must satisfy 0 < p < 2.")
 
-    eps = tf.constant(eps, dtype=tf.float32)
-    lam = tf.constant(lambda_A, dtype=tf.float32)
+    if min(mu1, mu2, mu3) < 0:
+        raise ValueError("Regularization coefficients must be nonnegative.")
 
-    # --------------------------------------------------
-    # Harmonic support
-    # --------------------------------------------------
+    if max_iter < 1:
+        raise ValueError("max_iter must be positive.")
 
-    if harmonic_mask is not None:
-        mask = tf.convert_to_tensor(
-            harmonic_mask, dtype=tf.float32
-        )
+    if tol < 0:
+        raise ValueError("tol must be nonnegative.")
 
-        tf.debugging.assert_equal(
-            tf.shape(mask), tf.stack([F, K])
-        )
+    if eps <= 0:
+        raise ValueError("eps must be positive.")
 
-        tf.debugging.assert_greater_equal(mask, 0.0)
-        tf.debugging.assert_less_equal(mask, 1.0)
+    update = update.lower()
+
+    if update not in ("both", "h", "w"):
+        raise ValueError("update must be 'both', 'H' or 'W'.")
+
+    # -------------------------------------------------------
+    # Divergence parameter
+    # -------------------------------------------------------
+    if r is None:
+        divergence_map = {
+            "euclidean": 0.0,
+            "kl": 1.0,
+            "is": 2.0,
+            "itakura-saito": 2.0,
+        }
+
+        if divergence.lower() not in divergence_map:
+            raise ValueError(
+                "divergence must be 'euclidean', 'kl' or 'is'."
+            )
+
+        r = divergence_map[divergence.lower()]
+
+    r = float(r)
+
+    if not 0 <= r <= 2:
+        raise ValueError("r must belong to [0, 2].")
+
+    # -------------------------------------------------------
+    # Initialization: deliberately use the same NumPy RNG as
+    # the reference implementation, then transfer to TensorFlow.
+    # -------------------------------------------------------
+    rng = np.random.default_rng(random_state)
+
+    if W_init is None:
+        if n_components is None:
+            raise ValueError("Provide either n_components or W_init.")
+
+        K = int(n_components)
+
+        if K < 1:
+            raise ValueError("n_components must be positive.")
+
+        W_np = rng.random((F, K)) + eps
+
     else:
-        mask = tf.ones((F, K), dtype=tf.float32)
+        W_np = np.asarray(W_init, dtype=np.float64).copy()
 
-    # --------------------------------------------------
-    # Initialization
-    # --------------------------------------------------
+        if W_np.ndim != 2 or W_np.shape[0] != F:
+            raise ValueError("W_init has an incompatible shape.")
 
-    if A_init is None:
-        A = tf.random.uniform(
-            (F, K),
-            minval=0.01,
-            maxval=1.0,
-            dtype=tf.float32,
-            seed=seed
-        )
+        K = W_np.shape[1]
+
+        if n_components is not None and n_components != K:
+            raise ValueError("n_components does not match W_init.")
+
+        if np.any(W_np < 0) or not np.all(np.isfinite(W_np)):
+            raise ValueError("W_init must be finite and nonnegative.")
+
+    if H_init is None:
+        H_np = None
     else:
-        A = tf.convert_to_tensor(
-            A_init, dtype=tf.float32
-        )
+        H_np = np.asarray(H_init, dtype=np.float64).copy()
 
-        tf.debugging.assert_equal(
-            tf.shape(A), tf.stack([F, K])
-        )
+        if H_np.shape != (K, T):
+            raise ValueError(f"H_init must have shape ({K}, {T}).")
 
-    if S_init is None:
-        S = tf.random.uniform(
-            (K, T),
-            minval=0.01,
-            maxval=1.0,
-            dtype=tf.float32,
-            seed=seed
-        )
-    else:
-        S = tf.convert_to_tensor(
-            S_init, dtype=tf.float32
-        )
+        if np.any(H_np < 0) or not np.all(np.isfinite(H_np)):
+            raise ValueError("H_init must be finite and nonnegative.")
 
-        tf.debugging.assert_equal(
-            tf.shape(S), tf.stack([K, T])
-        )
+    # Initial W normalization has the same semantics as the NumPy version.
+    if normalize_W:
+        scales = np.maximum(np.linalg.norm(W_np, axis=0), eps)
+        W_np /= scales[None, :]
 
-    tf.debugging.assert_greater_equal(A, 0.0)
-    tf.debugging.assert_greater_equal(S, 0.0)
+        if H_np is not None:
+            H_np *= scales[:, None]
 
-    A = A * mask
+    if H_np is None:
+        H_np = rng.random((K, T)) + eps
 
-    # --------------------------------------------------
-    # Shift operators
-    # --------------------------------------------------
-    
-    @tf.function
-    def shift_down_right(M):
-        return tf.pad(
-            M[:-shift_bins, :-1],
-            [[shift_bins, 0], [1, 0]]
-        )
-    
-    @tf.function
-    def shift_up_left(M):
-        return tf.pad(
-            M[shift_bins:, 1:],
-            [[0, shift_bins], [0, 1]]
-        )
-    
-    @tf.function
-    def shift_adjoint_product(M):
-        return tf.pad(
-            M[:-shift_bins, :-1],
-            [[0, shift_bins], [0, 1]]
-        )
+    # -------------------------------------------------------
+    # Validate regularization matrices and retain them as NumPy
+    # arrays until conversion to float64 TensorFlow tensors.
+    # -------------------------------------------------------
+    C_np = None
 
-    # --------------------------------------------------
-    # Compiled optimization
-    # --------------------------------------------------
-
-    @tf.function(reduce_retracing=True)
-    def optimize(X, A, S):
-
-        def cond(i, A, S):
-            return i < max_iter
-
-        def body(i, A, S):
-
-            # ------------------------------------------
-            # Update A
-            # ------------------------------------------
-
-            # Euclidean NMF gradient:
-            # A @ S @ S.T - X @ S.T
-
-            numerator_A = tf.matmul(
-                X, S, transpose_b=True
+    if mu2 > 0:
+        if cross_weights is None:
+            raise ValueError(
+                "cross_weights must be provided when mu2 > 0."
             )
 
-            denominator_A = tf.matmul(
-                A,
-                tf.matmul(S, S, transpose_b=True)
+        C_np = np.asarray(cross_weights, dtype=np.float64).copy()
+
+        if C_np.shape != (K, K):
+            raise ValueError(
+                f"cross_weights must have shape ({K}, {K})."
             )
 
-            # Regularization gradient:
-            #
-            # grad = A - T(A) - T*(A) + T*T(A)
-            #
-            # Split into positive and negative parts.
-
-            T_A = shift_down_right(A)
-            T_star_A = shift_up_left(A)
-            T_star_T_A = shift_adjoint_product(A)
-
-            grad_positive = A + T_star_T_A
-            grad_negative = T_A + T_star_A
-
-            numerator_A += lam * grad_negative
-            denominator_A += lam * grad_positive
-
-            A = A * (
-                numerator_A /
-                (denominator_A + eps)
+        if not np.all(np.isfinite(C_np)) or np.any(C_np < 0):
+            raise ValueError(
+                "cross_weights must be finite and nonnegative."
             )
 
-            A = tf.maximum(A, 0.0)
-            A = A * mask
+        if not np.allclose(C_np, C_np.T, atol=1e-8):
+            raise ValueError("cross_weights must be symmetric.")
 
-            # ------------------------------------------
-            # Update S
-            # ------------------------------------------
+        C_np = 0.5 * (C_np + C_np.T)
+        np.fill_diagonal(C_np, 0.0)
 
-            numerator_S = tf.matmul(
-                A, X, transpose_a=True
+    V_np = None
+
+    if mu3 > 0:
+        if temporal_weights is None:
+            raise ValueError(
+                "temporal_weights must be provided when mu3 > 0."
             )
 
-            denominator_S = tf.matmul(
-                tf.matmul(A, A, transpose_a=True),
-                S
+        V_np = np.asarray(temporal_weights, dtype=np.float64).copy()
+
+        if not np.all(np.isfinite(V_np)) or np.any(V_np < 0):
+            raise ValueError(
+                "temporal_weights must be finite and nonnegative."
             )
 
-            S = S * (
-                numerator_S /
-                (denominator_S + eps)
-            )
+        if V_np.ndim == 1:
+            V_np[0] = 0.0
 
-            S = tf.maximum(S, 0.0)
+        elif V_np.ndim == 2:
+            if V_np.shape != (T, T):
+                raise ValueError(
+                    f"2D temporal_weights must have shape ({T}, {T})."
+                )
 
-            return i + 1, A, S
+            if not np.allclose(V_np, V_np.T, atol=1e-8):
+                raise ValueError(
+                    "A dense temporal weighting matrix must be symmetric."
+                )
 
-        _, A, S = tf.while_loop(
-            cond,
-            body,
-            (tf.constant(0), A, S),
-            parallel_iterations=1
+            V_np = 0.5 * (V_np + V_np.T)
+            np.fill_diagonal(V_np, 0.0)
+
+        else:
+            raise ValueError("temporal_weights must be 1D or 2D.")
+
+    # -------------------------------------------------------
+    # Select device and move all calculation arrays to TF.
+    # Explicit placement uses the GPU if TensorFlow detects one.
+    # -------------------------------------------------------
+    device = "/GPU:0" if tf.config.list_physical_devices("GPU") else "/CPU:0"
+
+    with tf.device(device):
+        tf_dtype = tf.float64
+        eps_tf = tf.constant(eps, dtype=tf_dtype)
+
+        X_tf = tf.convert_to_tensor(X_np, dtype=tf_dtype)
+        W_tf = tf.convert_to_tensor(W_np, dtype=tf_dtype)
+        H_tf = tf.convert_to_tensor(H_np, dtype=tf_dtype)
+
+        C_tf = (
+            tf.convert_to_tensor(C_np, dtype=tf_dtype)
+            if C_np is not None
+            else None
+        )
+        V_tf = (
+            tf.convert_to_tensor(V_np, dtype=tf_dtype)
+            if V_np is not None
+            else None
         )
 
-        return A, S
+        def calculate_objective(W, H):
+            Y = tf.maximum(tf.matmul(W, H), eps_tf)
+            loss = _tf_beta_divergence(X_tf, Y, r, eps_tf)
 
-    A, S = optimize(X, A, S)
+            if mu1 > 0:
+                loss = loss + mu1 * tf.reduce_sum(tf.pow(H, p))
 
-    # --------------------------------------------------
-    # Return results
-    # --------------------------------------------------
+            if mu2 > 0:
+                HHt = tf.matmul(H, H, transpose_b=True)
+                loss = loss + mu2 * tf.reduce_sum(C_tf * HHt)
 
-    if return_loss:
-        reconstruction = tf.matmul(A, S)
+            if mu3 > 0:
+                HV = _tf_temporal_product(H, V_tf)
+                beta3 = -mu3 * tf.reduce_sum(H * HV)
 
-        reconstruction_loss = 0.5 * tf.reduce_sum(
-            tf.square(X - reconstruction)
-        )
+                if temporal_exponential:
+                    temporal_term = tf.exp(
+                        tf.clip_by_value(beta3, -50.0, 50.0)
+                    )
+                else:
+                    temporal_term = beta3
 
-        harmonic_loss = 0.5 * lam * tf.reduce_sum(
-            tf.square(A - shift_down_right(A))
-        )
+                loss = loss + temporal_term
 
-        loss = reconstruction_loss + harmonic_loss
+            return loss
 
-        return A.numpy(), S.numpy(), float(loss.numpy())
+        # Compile one complete iteration as a TensorFlow graph. This avoids
+        # Python dispatch for every matrix operation in every iteration.
+        @tf.function(autograph=False, reduce_retracing=True)
+        def optimization_step(W, H):
+            # ===============================================
+            # Update W
+            # ===============================================
+            if update in ("both", "w"):
+                Y = tf.maximum(tf.matmul(W, H), eps_tf)
 
-    return A.numpy(), S.numpy()
+                X_weighted = X_tf * tf.pow(Y, -r)
+                Y_weighted = tf.pow(Y, 1.0 - r)
+
+                numerator_W = tf.matmul(
+                    X_weighted, H, transpose_b=True
+                )
+                denominator_W = tf.matmul(
+                    Y_weighted, H, transpose_b=True
+                )
+
+                W = W * (
+                    tf.maximum(numerator_W, eps_tf)
+                    / tf.maximum(denominator_W, eps_tf)
+                )
+
+                if normalize_W:
+                    scales = tf.maximum(
+                        tf.linalg.norm(W, axis=0), eps_tf
+                    )
+                    W = W / scales[tf.newaxis, :]
+                    H = H * scales[:, tf.newaxis]
+
+            # ===============================================
+            # Update H
+            # ===============================================
+            if update in ("both", "h"):
+                Y = tf.maximum(tf.matmul(W, H), eps_tf)
+
+                X_weighted = X_tf * tf.pow(Y, -r)
+                Y_weighted = tf.pow(Y, 1.0 - r)
+
+                numerator_H = tf.matmul(
+                    W, X_weighted, transpose_a=True
+                )
+                denominator_H = tf.matmul(
+                    W, Y_weighted, transpose_a=True
+                )
+
+                # 1. Sparsity regularization
+                if mu1 > 0:
+                    sparsity_gradient = (
+                        mu1 * p * tf.pow(tf.maximum(H, eps_tf), p - 1.0)
+                    )
+                    denominator_H = denominator_H + sparsity_gradient
+
+                # 2. Cross-correlation regularization
+                if mu2 > 0:
+                    cross_gradient = (
+                        2.0 * mu2 * tf.matmul(C_tf, H)
+                    )
+                    denominator_H = denominator_H + cross_gradient
+
+                # 3. Temporal regularization
+                if mu3 > 0:
+                    HV = _tf_temporal_product(H, V_tf)
+                    beta3 = -mu3 * tf.reduce_sum(H * HV)
+
+                    if temporal_exponential:
+                        temporal_scale = tf.exp(
+                            tf.clip_by_value(beta3, -50.0, 50.0)
+                        )
+                    else:
+                        temporal_scale = tf.constant(1.0, dtype=tf_dtype)
+
+                    numerator_H = numerator_H + (
+                        2.0 * mu3 * temporal_scale * HV
+                    )
+
+                H = H * (
+                    tf.maximum(numerator_H, eps_tf)
+                    / tf.maximum(denominator_H, eps_tf)
+                )
+
+            current_loss = calculate_objective(W, H)
+            return W, H, current_loss
+
+        history = []
+        previous_loss = None
+
+        for iteration in range(max_iter):
+            W_tf, H_tf, current_loss_tf = optimization_step(W_tf, H_tf)
+            current_loss = float(current_loss_tf.numpy())
+            history.append(current_loss)
+
+            if previous_loss is not None and tol > 0:
+                relative_change = (
+                    abs(previous_loss - current_loss)
+                    / max(abs(previous_loss), eps)
+                )
+
+                if relative_change < tol:
+                    break
+
+            previous_loss = current_loss
+
+        W_out = W_tf.numpy()
+        H_out = H_tf.numpy()
+
+    if return_history:
+        return W_out, H_out, np.asarray(history)
+
+    return W_out, H_out
+
 
 
 def build_hnma_mask(
@@ -1035,15 +1193,17 @@ def extract_binary_data():
         midi_min=21,
         n_harmonics=10
     )
-    W, H = hnma_tf(
+    W, H = regularized_nmf_tf(
         spectrogram,
-        n_components=88,
-        harmonic_mask=mask,
-        lambda_A=10,
-        shift_bins=K,
-        max_iter=500
+        W_init=mask,
+        divergence="kl",
+        update="both",
+        normalize_W=False,
+        max_iter=500,
+        tol=1e-6,
+        random_state=42
     )
-    H = normalize_NMF(W,H)[1]
+    (W, H) = normalize_NMF(W,H)
     B = midi_to_cqt_labels(
       file_name_string_audio[:-3]+"mid",
       n_frames=H.shape[1],
@@ -1076,6 +1236,7 @@ if my_file.is_file():
     
     data = [loaded[key] for key in data_keys]
     H = loaded["H"]
+    W = loaded["W"]
     H1 = med_filter(H,sz=9)
     #H1 = med_filter(H)
     H2 = np.zeros_like(H1)
@@ -1088,7 +1249,7 @@ if my_file.is_file():
     M = midi_to_cqt_labels("Prelude-in-E-Minor-Nr-4.mid", H.shape[1], 44100, HOP)
     #z = analyse_spectrogram(spectrogram, onsets)
     #H6 = clear_H(H5,onsets,z)
-    H = normalize_NMF(W,H)[1]
+    (W, H) = normalize_NMF(W,H)
     H = norm_log(H,5)
     plt.figure()
     plt.imshow(H5, aspect='auto', origin='lower')
@@ -1129,17 +1290,19 @@ else:
         n_harmonics=10
     )
     
-    W, H = hnma_tf(
+    W, H = regularized_nmf_tf(
         spectrogram,
-        n_components=88,
-        harmonic_mask=mask,
-        lambda_A=10,
-        shift_bins=K,
-        max_iter=500
+        W_init=mask,
+        divergence="kl",
+        update="both",
+        normalize_W=False,
+        max_iter=500,
+        tol=1e-6,
+        random_state=42
     )
     
     V_hat = W @ H
-    H = normalize_NMF(W,H)[1]
+    (W, H) = normalize_NMF(W,H)
     H = norm_log(H,5)
     print("W:", W.shape)
     print("H:", H.shape)
@@ -1237,7 +1400,7 @@ else:
     }
     
     save_dict["H"] = H
-    
+    save_dict["W"] = W
     np.savez("traindata.npz", **save_dict)
 
 train_tracks = [(l[0].T,l[1].T) for l in data[0:(len(data)*6)//8]]
