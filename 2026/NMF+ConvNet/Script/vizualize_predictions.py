@@ -201,7 +201,16 @@ elif(x.dtype==np.int16):
 else:
   raise ValueError(f"Unsupported sample type: {x.dtype}")
 spectrogram = np.abs(librosa.cqt(x,sr=f_s, fmin=librosa.note_to_hz('A0'), bins_per_octave=12 * 5, n_bins=88 * 5+0, hop_length=HOP_SIZE, sparsity=0.05))
-onsets = librosa.onset.onset_detect(y=x, sr=f_s, hop_length=HOP_SIZE,units='frames')
+onsets = librosa.onset.onset_detect(y=x, sr=f_s, hop_length=HOP_SIZE,units='frames').tolist()
+
+#remove onsets with distance less than 7 frames
+'''i = 0
+while(i<len(onsets)-1):
+	if(onsets[i+1]-onsets[i]<=6):
+		onsets.pop(i+1)		
+		continue	
+	i += 1
+print(onsets)'''
 
 workflow = []
 
@@ -218,7 +227,9 @@ for i in range(CONTEXT_FRAMES//2, H.shape[1] - CONTEXT_FRAMES//2):
 workflow = np.array(workflow)
 a = find_best_threshold(M[:,CONTEXT_FRAMES//2:-(CONTEXT_FRAMES//2)], workflow.T)
 binary_piano_roll = (workflow >= a[0]).astype(np.uint8).T
-#binary_piano_roll = postprocess_binary_piano_roll(binary_piano_roll, onsets, 12)
+#postprocess_binary_piano_roll() works well with clearing onsets array (look in code above)
+'''binary_piano_roll1 = (workflow >= a[0]-0.1).astype(np.uint8).T
+binary_piano_roll1 = postprocess_binary_piano_roll(binary_piano_roll1, onsets, 12)'''
 #binary_piano_roll = enforce_min_duration(binary_piano_roll,min_len=12)
 
 import matplotlib.pyplot as plt

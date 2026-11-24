@@ -1196,6 +1196,8 @@ def extract_binary_data():
     W, H = regularized_nmf_tf(
         spectrogram,
         W_init=mask,
+        mu1=1e-3,
+        p=1.0,
         divergence="kl",
         update="both",
         normalize_W=False,
@@ -1293,6 +1295,8 @@ else:
     W, H = regularized_nmf_tf(
         spectrogram,
         W_init=mask,
+        mu1=1e-3,
+        p=1.0,
         divergence="kl",
         update="both",
         normalize_W=False,
